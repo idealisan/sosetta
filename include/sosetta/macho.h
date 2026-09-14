@@ -14,6 +14,7 @@
 #define LC_SEGMENT      0x01u
 #define LC_SYMTAB       0x02u
 #define LC_UNIXTHREAD   0x05u
+#define LC_DYSYMTAB     0x0Bu
 #define LC_SEGMENT_64   0x19u
 
 #define PPC_THREAD_STATE        1u
@@ -21,11 +22,21 @@
 
 #define SG_ZEROFILL 0x01u
 
+#define S_ZEROFILL                 0x01u
+#define S_NON_LAZY_SYMBOL_POINTERS 0x06u
+#define S_LAZY_SYMBOL_POINTERS     0x07u
+#define S_SYMBOL_STUBS             0x08u
+
+#define SECTION_TYPE(x)     ((x) & 0xFFu)
+#define INDIRECT_SYMBOL_LOCAL 0x80000000u
+#define INDIRECT_SYMBOL_ABS   0x40000000u
+
 #define VM_PROT_READ  0x01u
 #define VM_PROT_WRITE 0x02u
 #define VM_PROT_EXEC  0x04u
 
 #define SEGNAME_MAX 17
+#define SECNAME_MAX 17
 
 typedef struct sosetta_seg {
     char     segname[SEGNAME_MAX];
@@ -37,6 +48,17 @@ typedef struct sosetta_seg {
     uint32_t initprot;
     uint32_t flags;
 } sosetta_seg;
+
+typedef struct sosetta_sect {
+    char     sectname[SECNAME_MAX];
+    char     segname[SECNAME_MAX];
+    uint32_t addr;
+    uint32_t size;
+    uint32_t offset;
+    uint32_t flags;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} sosetta_sect;
 
 typedef struct sosetta_thread {
     int      has_thread;
@@ -59,10 +81,16 @@ typedef struct sosetta_macho {
     uint32_t       flags;
     sosetta_seg   *segs;
     size_t         nsegs;
+    sosetta_sect  *sects;
+    size_t         nsects;
     uint32_t       symoff;
     uint32_t       nsyms;
     uint32_t       stroff;
     uint32_t       strsize;
+    uint32_t       indirectsymoff;
+    uint32_t       nindirectsyms;
+    uint32_t       iundefsym;
+    uint32_t       nundefsym;
     sosetta_thread thread;
 } sosetta_macho;
 
@@ -70,5 +98,9 @@ int sosetta_macho_parse(const void *data, size_t size, sosetta_macho *out,
                         char *errbuf, size_t errsz);
 void sosetta_macho_free(sosetta_macho *m);
 const char *sosetta_macho_strerror(int rc, const char *errbuf, size_t errsz);
+
+int sosetta_macho_sym_name(const sosetta_macho *m, uint32_t symidx,
+                           const char **out);
+int sosetta_macho_sym_undef(const sosetta_macho *m, uint32_t symidx);
 
 #endif

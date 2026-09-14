@@ -9,7 +9,9 @@
 #define HDR64_SIZE 32u
 #define SEG32_SIZE 56u
 #define SEG64_SIZE 72u
+#define SECT32_SIZE 68u
 #define SYMTAB_SIZE 24u
+#define DYSYMTAB_SIZE 80u
 #define THREAD_CMD_SIZE 16u
 
 static const char *err_ok = "ok";
@@ -29,6 +31,17 @@ static int append_seg(sosetta_macho *m, const sosetta_seg *seg)
     }
     m->segs = n;
     m->segs[m->nsegs++] = *seg;
+    return 0;
+}
+
+static int append_sect(sosetta_macho *m, const sosetta_sect *sect)
+{
+    sosetta_sect *n = realloc(m->sects, (m->nsects + 1) * sizeof(*n));
+    if (!n) {
+        return -1;
+    }
+    m->sects = n;
+    m->sects[m->nsects++] = *sect;
     return 0;
 }
 
@@ -113,6 +126,35 @@ static int parse_thin(const uint8_t *d, size_t n, sosetta_macho *m,
                 set_err(errbuf, errsz, "out of memory");
                 goto fail;
             }
+            if (size >= SEG32_SIZE + SECT32_SIZE) {
+                uint32_t nsects = be32(d + off + 48);
+                uint32_t so;
+                uint32_t s;
+                if (nsects > 256u || SEG32_SIZE + nsects * SECT32_SIZE > size) {
+                    set_err(errbuf, errsz, "bad section count");
+                    goto fail;
+                }
+                so = off + SEG32_SIZE;
+                for (s = 0; s < nsects; s++) {
+                    sosetta_sect sect;
+                    memset(&sect, 0, sizeof(sect));
+                    memcpy(sect.sectname, d + so, 16);
+                    sect.sectname[16] = '\0';
+                    memcpy(sect.segname, d + so + 16, 16);
+                    sect.segname[16] = '\0';
+                    sect.addr = be32(d + so + 32);
+                    sect.size = be32(d + so + 36);
+                    sect.offset = be32(d + so + 40);
+                    sect.flags = be32(d + so + 56);
+                    sect.reserved1 = be32(d + so + 60);
+                    sect.reserved2 = be32(d + so + 64);
+                    if (append_sect(m, &sect) != 0) {
+                        set_err(errbuf, errsz, "out of memory");
+                        goto fail;
+                    }
+                    so += SECT32_SIZE;
+                }
+            }
             break;
 
         case LC_SEGMENT_64:
@@ -146,27 +188,40 @@ static int parse_thin(const uint8_t *d, size_t n, sosetta_macho *m,
             m->strsize = be32(d + off + 20);
             break;
 
+        case LC_DYSYMTAB:
+            if (size < DYSYMTAB_SIZE) {
+                set_err(errbuf, errsz, "bad LC_DYSYMTAB command");
+                goto fail;
+            }
+            m->indirectsymoff = be32(d + off + 8 + 48);
+            m->nindirectsyms = be32(d + off + 8 + 52);
+            m->iundefsym = be32(d + off + 8 + 16);
+            m->nundefsym = be32(d + off + 8 + 20);
+            break;
+
         case LC_UNIXTHREAD:
-            if (size < THREAD_CMD_SIZE + PPC_THREAD_STATE_COUNT * 4u) {
+            if (size < THREAD_CMD_SIZE) {
                 set_err(errbuf, errsz, "bad LC_UNIXTHREAD command");
                 goto fail;
             }
             if (be32(d + off + 8) == PPC_THREAD_STATE) {
                 const uint8_t *st = d + off + THREAD_CMD_SIZE;
                 uint32_t count = be32(d + off + 12);
-                if (count > PPC_THREAD_STATE_COUNT) {
-                    count = PPC_THREAD_STATE_COUNT;
+                uint32_t maxcount = (size - THREAD_CMD_SIZE) / 4u;
+                if (count > maxcount) {
+                    set_err(errbuf, errsz, "bad LC_UNIXTHREAD command");
+                    goto fail;
                 }
                 if (count >= 4u) {
                     m->thread.has_thread = 1;
                     m->thread.entry_pc = be32(st);
                     m->thread.entry_sp = be32(st + 3 * 4);
                 }
-                if (count >= 35u) {
+                if (count >= 38u) {
                     m->thread.cr = be32(st + 34 * 4);
-                    m->thread.xer = be32(st + 35 * 4);
-                    m->thread.lr = be32(st + 36 * 4);
-                    m->thread.ctr = be32(st + 37 * 4);
+                    m->thread.lr = be32(st + 35 * 4);
+                    m->thread.ctr = be32(st + 36 * 4);
+                    m->thread.xer = be32(st + 37 * 4);
                 }
             }
             break;
@@ -252,6 +307,44 @@ void sosetta_macho_free(sosetta_macho *m)
     free(m->segs);
     m->segs = NULL;
     m->nsegs = 0;
+    free(m->sects);
+    m->sects = NULL;
+    m->nsects = 0;
+}
+
+int sosetta_macho_sym_name(const sosetta_macho *m, uint32_t symidx,
+                           const char **out)
+{
+    uint32_t strx;
+    size_t i;
+    const uint8_t *s;
+
+    if (!m || symidx >= m->nsyms || !out) {
+        return -1;
+    }
+    strx = be32(m->data + m->symoff + symidx * 12u);
+    if (strx >= m->strsize) {
+        return -1;
+    }
+    s = m->data + m->stroff + strx;
+    for (i = 0; i < m->strsize - strx; i++) {
+        if (s[i] == '\0') {
+            *out = (const char *)s;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int sosetta_macho_sym_undef(const sosetta_macho *m, uint32_t symidx)
+{
+    uint8_t n_type;
+
+    if (!m || symidx >= m->nsyms) {
+        return -1;
+    }
+    n_type = m->data[m->symoff + symidx * 12u + 4u];
+    return (n_type & 0x0Eu) == 0x00u ? 1 : 0;
 }
 
 const char *sosetta_macho_strerror(int rc, const char *errbuf, size_t errsz)

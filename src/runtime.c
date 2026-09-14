@@ -1,5 +1,6 @@
 #include "sosetta/runtime.h"
 #include "sosetta/endian.h"
+#include "sosetta/hle.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,8 +8,26 @@
 
 #define RUNTIME_PAGE_SIZE 0x1000u
 #define RUN_TIMEOUT_US    5000000u
+#define DYLD_STUB_BASE    0x8fe00000u
+#define DYLD_STUB_SIZE    0x100000u
 
 static int has_thread_with_sp(const sosetta_runtime *rt);
+
+static int rt_trace(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("SOSETTA_TRACE") != NULL;
+    }
+    return on;
+}
+
+static void rt_trace_msg(const char *step)
+{
+    if (rt_trace()) {
+        fprintf(stderr, "[sosetta] setup_stack failed at: %s\n", step);
+    }
+}
 
 static int read_file_all(const char *path, uint8_t **out, size_t *outn,
                          char *errbuf, size_t errsz)
@@ -184,6 +203,26 @@ int sosetta_runtime_load(sosetta_runtime *rt)
         }
     }
 
+    {
+        uint32_t stub[2];
+        uint32_t a;
+        stub[0] = 0x38600000u;
+        stub[1] = 0x4e800020u;
+        if (sosetta_guest_map(rt->guest, DYLD_STUB_BASE, DYLD_STUB_SIZE,
+                              VM_PROT_READ | VM_PROT_EXEC) == 0) {
+            for (a = 0; a < DYLD_STUB_SIZE; a += sizeof(stub)) {
+                sosetta_guest_write(rt->guest, DYLD_STUB_BASE + a, stub,
+                                    sizeof(stub));
+            }
+        }
+    }
+
+    if (sosetta_hle_bind(rt->guest, &rt->sys, im) != 0) {
+        if (rt_trace()) {
+            fprintf(stderr, "[sosetta] hle bind failed (missing regions?)\n");
+        }
+    }
+
     if (im->thread.has_thread) {
         rt->entry_pc = im->thread.entry_pc;
     } else if (found_exec) {
@@ -232,8 +271,15 @@ int sosetta_runtime_setup_stack(sosetta_runtime *rt, int argc, char **argv,
     stack_base = (stack_top - SOSETTA_STACK_SIZE) & ~(uint32_t)(RUNTIME_PAGE_SIZE - 1);
 
     if (sosetta_guest_map(rt->guest, stack_base, stack_top - stack_base,
-                          VM_PROT_READ | VM_PROT_WRITE) != 0) {
-        return -1;
+                          VM_PROT_READ | VM_PROT_WRITE) != 0 &&
+        stack_top != SOSETTA_STACK_TOP) {
+        stack_top = SOSETTA_STACK_TOP;
+        stack_base = (stack_top - SOSETTA_STACK_SIZE) & ~(uint32_t)(RUNTIME_PAGE_SIZE - 1);
+        if (sosetta_guest_map(rt->guest, stack_base, stack_top - stack_base,
+                              VM_PROT_READ | VM_PROT_WRITE) != 0) {
+            rt_trace_msg("map stack region");
+            return -1;
+        }
     }
     rt->stack_top = stack_top;
     rt->stack_base = stack_base;
@@ -253,6 +299,7 @@ int sosetta_runtime_setup_stack(sosetta_runtime *rt, int argc, char **argv,
     top_aligned = stack_top & ~(uint32_t)0x0Fu;
     sp = (top_aligned - (uint32_t)total_len) & ~(uint32_t)0x0Fu;
     if (sp < stack_base) {
+        rt_trace_msg("sp below stack_base");
         return -1;
     }
     actual_len = top_aligned - sp;
@@ -261,6 +308,7 @@ int sosetta_runtime_setup_stack(sosetta_runtime *rt, int argc, char **argv,
     argv_ptr = (uint32_t *)calloc(argw, sizeof(*argv_ptr));
     env_ptr = (uint32_t *)calloc(envw, sizeof(*env_ptr));
     if (!blk || !argv_ptr || !env_ptr) {
+        rt_trace_msg("allocation");
         free(blk);
         free(argv_ptr);
         free(env_ptr);
@@ -300,6 +348,7 @@ int sosetta_runtime_setup_stack(sosetta_runtime *rt, int argc, char **argv,
     off += 4;
 
     if (sosetta_guest_write(rt->guest, sp, blk, actual_len) != 0) {
+        rt_trace_msg("write stack block");
         free(blk);
         free(argv_ptr);
         free(env_ptr);
@@ -340,8 +389,45 @@ int sosetta_runtime_run(sosetta_runtime *rt)
     }
 
     rt->guest->run_timeout_us = RUN_TIMEOUT_US;
-    if (sosetta_guest_run(rt->guest) != 0) {
-        return -1;
+    for (;;) {
+        int uerr = sosetta_guest_run(rt->guest);
+        if (rt->sys.trap_pending) {
+            rt->sys.trap_pending = 0;
+            if (sosetta_guest_set_pc(rt->guest, rt->sys.resume_pc) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (uerr != 0) {
+            uint32_t pc = 0;
+            (void)sosetta_guest_get_pc(rt->guest, &pc);
+            fprintf(stderr, "[sosetta] guest stopped: %s (pc=0x%08x)\n",
+                    uc_strerror((uc_err)uerr), pc);
+            {
+                unsigned ri;
+                uint32_t rv;
+                static const unsigned regs[6] = { 0, 1, 2, 3, 11, 12 };
+                for (ri = 0; ri < 6; ri++) {
+                    sosetta_guest_get_gpr(rt->guest, regs[ri], &rv);
+                    fprintf(stderr, "[sosetta]   r%u=0x%08x\n", regs[ri], rv);
+                }
+                {
+                    uint32_t sp = 0;
+                    uint8_t stk[32];
+                    unsigned w;
+                    sosetta_guest_get_gpr(rt->guest, 1, &sp);
+                    if (sosetta_guest_read(rt->guest, sp, stk, sizeof(stk)) == 0) {
+                        for (w = 0; w < 8; w++) {
+                            fprintf(stderr, "[sosetta]   sp+0x%02x = 0x%08x\n",
+                                    w * 4u, be32(stk + w * 4u));
+                        }
+                    }
+                }
+            }
+            sosetta_guest_dump_trace();
+            return -1;
+        }
+        break;
     }
 
     rt->exit_code = rt->sys.exit_code;

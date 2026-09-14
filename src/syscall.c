@@ -2,24 +2,14 @@
 
 #include "sosetta/syscall.h"
 #include "sosetta/cpu.h"
-
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#define DARWIN_SYS_exit    1
 #define DARWIN_SYS_fork    2
-#define DARWIN_SYS_read    3
-#define DARWIN_SYS_write   4
-#define DARWIN_SYS_open    5
-#define DARWIN_SYS_close   6
-#define DARWIN_SYS_unlink  10
-#define DARWIN_SYS_getpid  20
-#define DARWIN_SYS_lseek   199
-#define DARWIN_SYS_mmap    197
-#define DARWIN_SYS_munmap  198
 
 #define DARWIN_PROT_READ  0x1u
 #define DARWIN_PROT_WRITE 0x2u
@@ -36,6 +26,53 @@
 #define DARWIN_MAP_FIXED  0x0010u
 
 #define MAX_IO_SIZE (1u << 20)
+
+#define TRACE_SEEN_BITS 4096u
+#define TRACE_MAX_LINES 256u
+
+static int trace_state = -1;
+static unsigned char trace_seen[TRACE_SEEN_BITS / 8];
+static unsigned trace_lines;
+
+static int trace_enabled(void)
+{
+    if (trace_state < 0) {
+        trace_state = getenv("SOSETTA_TRACE") != NULL;
+    }
+    return trace_state;
+}
+
+static void trace_missing(uint32_t nr, const uint32_t *a)
+{
+    if (!trace_enabled() || trace_lines >= TRACE_MAX_LINES) {
+        return;
+    }
+    if (nr < TRACE_SEEN_BITS) {
+        if (trace_seen[nr >> 3] & (unsigned char)(1u << (nr & 7u))) {
+            return;
+        }
+        trace_seen[nr >> 3] |= (unsigned char)(1u << (nr & 7u));
+    }
+    trace_lines++;
+    if (nr >= 0x80000000u) {
+        fprintf(stderr, "[sosetta] unimplemented mach trap %d (lr=0x%08x)\n",
+                -(int32_t)nr, a[4]);
+    } else {
+        fprintf(stderr,
+                "[sosetta] unimplemented syscall %u (args 0x%08x 0x%08x 0x%08x 0x%08x)\n",
+                nr, a[0], a[1], a[2], a[3]);
+    }
+}
+
+static void trace_fail(uint32_t nr, int32_t ret)
+{
+    if (!trace_enabled() || trace_lines >= TRACE_MAX_LINES) {
+        return;
+    }
+    trace_lines++;
+    fprintf(stderr, "[sosetta] syscall %d failed errno=%d\n",
+            (int32_t)nr, -ret);
+}
 
 int sosetta_syscall_errno_to_darwin(int linux_errno)
 {
@@ -165,8 +202,8 @@ static int guest_munmap_anon(sosetta_guest *g, sosetta_syscall_ctx *ctx,
     return 0;
 }
 
-static void dispatch(sosetta_guest *g, sosetta_syscall_ctx *ctx, uint32_t nr,
-                     const uint32_t *a, uint32_t *ret)
+void sosetta_bsd_syscall(sosetta_guest *g, sosetta_syscall_ctx *ctx, uint32_t nr,
+                         const uint32_t *a, uint32_t *ret)
 {
     int fd;
     char path[4096];
@@ -180,6 +217,7 @@ static void dispatch(sosetta_guest *g, sosetta_syscall_ctx *ctx, uint32_t nr,
 
     case DARWIN_SYS_fork:
     default:
+        trace_missing(nr, a);
         *ret = (uint32_t)fail_linux(ENOSYS);
         return;
 
@@ -327,6 +365,14 @@ void sosetta_syscall_hook(sosetta_guest *g, uint32_t intno)
         }
     }
 
-    dispatch(g, ctx, nr, a, &ret);
+    sosetta_bsd_syscall(g, ctx, nr, a, &ret);
+
+    if ((int32_t)ret < 0) {
+        trace_fail(nr, (int32_t)ret);
+        if (ctx->errno_addr != 0) {
+            uint32_t de = (uint32_t)(-(int32_t)ret);
+            sosetta_guest_write(g, ctx->errno_addr, &de, 4);
+        }
+    }
     sosetta_guest_set_gpr(g, 3, ret);
 }
