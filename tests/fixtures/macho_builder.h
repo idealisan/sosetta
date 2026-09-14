@@ -100,6 +100,16 @@ static void mf_payload_bytes(mf_builder *b, const void *p, size_t n)
     b->payload_len += n;
 }
 
+static void mf_copy_segname(char dst[16], const char *src)
+{
+    size_t n = strlen(src);
+    if (n >= 16u) {
+        n = 15u;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 static void mf_add_seg(mf_builder *b, const char *name, uint32_t vmaddr,
                        uint32_t vmsize, uint32_t initprot, uint32_t maxprot,
                        const void *data, uint32_t filesize)
@@ -112,7 +122,7 @@ static void mf_add_seg(mf_builder *b, const char *name, uint32_t vmaddr,
     }
     s = &b->segs[b->nsegs];
     memset(s, 0, sizeof(*s));
-    strncpy(s->segname, name, 16);
+    mf_copy_segname(s->segname, name);
     s->vmaddr = vmaddr;
     s->vmsize = vmsize;
     s->initprot = initprot;
