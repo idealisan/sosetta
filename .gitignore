@@ -1,0 +1,15 @@
+# Build directories
+/build/
+/cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Editor/IDE
+.vscode/
+.idea/
+compile_commands.json
+.cache/
