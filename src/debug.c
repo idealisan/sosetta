@@ -173,12 +173,31 @@ struct d_bp {
 static struct d_bp *d_bps;
 static size_t d_nbps;
 
+static unsigned d_bp_limit;
+static int d_bp_limit_ready = -1;
+
+static unsigned d_bp_limit_get(void)
+{
+    if (d_bp_limit_ready < 0) {
+        const char *v = getenv("SOSETTA_BP_HITS");
+        d_bp_limit = (v && *v) ? (unsigned)strtoul(v, NULL, 0) : 3u;
+        if (!d_bp_limit) {
+            d_bp_limit = 3u;
+        }
+        d_bp_limit_ready = 1;
+    }
+    return d_bp_limit;
+}
+
 static void d_bp_cb(uc_engine *uc, uint64_t address, uint32_t size,
                     void *user_data)
 {
     size_t i;
     uint32_t pc = (uint32_t)address;
     uint32_t lr = 0;
+    uint32_t r3 = 0;
+    uint32_t r4 = 0;
+    uint32_t r5 = 0;
     char sym[128];
     char lrsym[128];
 
@@ -189,15 +208,19 @@ static void d_bp_cb(uc_engine *uc, uint64_t address, uint32_t size,
             break;
         }
     }
-    if (i >= d_nbps || d_bps[i].hits >= 3u) {
+    if (i >= d_nbps || d_bps[i].hits >= d_bp_limit_get()) {
         return;
     }
     d_bps[i].hits++;
     uc_reg_read(uc, UC_PPC_REG_LR, &lr);
+    sosetta_guest_get_gpr(d_guest, 3, &r3);
+    sosetta_guest_get_gpr(d_guest, 4, &r4);
+    sosetta_guest_get_gpr(d_guest, 5, &r5);
     sosetta_debug_sym(pc, sym, sizeof(sym));
     sosetta_debug_sym(lr, lrsym, sizeof(lrsym));
-    fprintf(stderr, "[sosetta] bp[%zu] hit 0x%08x (%s) lr=0x%08x (%s)\n",
-            i, pc, sym, lr, lrsym);
+    fprintf(stderr,
+            "[sosetta] bp[%zu] hit 0x%08x (%s) lr=0x%08x (%s) r3=0x%08x r4=0x%08x r5=0x%08x\n",
+            i, pc, sym, lr, lrsym, r3, r4, r5);
 }
 
 static uint32_t d_step_begin;

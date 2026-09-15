@@ -2975,9 +2975,9 @@ void sosetta_hle_call(sosetta_guest *g, sosetta_syscall_ctx *ctx,
         uc_reg_read(g->uc, UC_PPC_REG_LR, &lr);
         sosetta_guest_read(g, 0x570738u, &km, 4);
         fprintf(stderr,
-                "[sosetta] hle call id=%u %s (pc=0x%08x lr=0x%08x km=0x%08x r3=0x%08x)\n",
+                "[sosetta] hle call id=%u %s (pc=0x%08x lr=0x%08x km=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x)\n",
                 id, id < HLE_TABLE_N ? hle_table[id].name : "?", pc, lr, km,
-                a[0]);
+                a[0], a[1], a[2]);
     }
     if (pc == TRAP_PTHREAD_RET) {
         if (pts.active) {
