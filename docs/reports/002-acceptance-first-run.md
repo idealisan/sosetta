@@ -103,3 +103,42 @@ SOSETTA_TRACE=1 ../build/sosetta curl-8.12.1-ld64/curl --version
 SOSETTA_TRACE=1 ../build/sosetta ffmpeg-7.1.1-ld64/ffprobe -version
 SOSETTA_TRACE=1 ../build/sosetta usr/local/bin/python3.13 -V
 ```
+
+
+---
+
+## 追加（2026-09-14 第二轮：加载期绑定 + libc HLE 实现）
+
+### 实现内容
+
+1. **加载期符号绑定**（`macho.c` section/DYSYMTAB 解析 + `hle.c` 绑定 pass）：解析 section 头（含 reserved1/reserved2 间接符号索引），将 `__la_symbol_ptr` 槽位重写为 HLE 陷阱地址；`__nl_symbol_ptr` 中的数据符号（`___sF`、`__DefaultRuneLocale`、`__cthread_init_routine`、`_mach_init_routine`、`_errno`）填入 guest 存储地址；`__dyld` 段重定向到可写 shim 页。
+2. **HLE 跳板机制**：陷阱区（未映射）+ `UC_HOOK_MEM_FETCH_UNMAPPED` 按地址分发 → 宿主执行 → `uc_emu_stop` + runtime 循环恢复到 LR。曾尝试 `sc` 指令跳板，但 Unicorn PPC 对 `sc` 存在双重 `nip += 4` 及状态回滚问题，弃用。
+3. **libc HLE v1**（~150 符号）：malloc/calloc/realloc/free（guest 堆 arena + 地址序合并空闲链）、str/mem 族、stdio（FILE 槽位 + fopen/fread/fwrite/printf 精简实现）、getenv/atexit/signal、pthread 全系（stub）、zlib stub、bsearch（**客户机比较回调**经陷阱往返执行）、qsort（暂为 no-op）。
+4. **网络 HLE**：socket/connect/send/recv/getsockopt(SO_ERROR)/select（fd 映射表）、getaddrinfo（数值 IPv4）、fstat/stat（Darwin 结构布局）、fcntl。
+5. **dyld 语义**：`dyld_func_lookup`（写返回桩地址）、`__dyld_image_count=1`、`get_image_header/name` 陷阱、crt 的 `__dyld[1]` 置零操作落在可写 shim 页。
+6. **诊断增强**：HLE 调用/返回值跟踪、`SOSETTA_WATCH` 写监视点、写保护报告、块级环形缓冲。
+
+### 关键 bug 与修复
+
+| Bug | 根因 | 修复 |
+|-----|------|------|
+| section flags/reserved 偏移错误 | Mach-O section 头 flags 在 +56（误写 +60） | 修正后绑定立即生效 |
+| dyld 桩区字节序错误 | `uc_mem_write` 传入宿主机序 uint32 数组 | `put_be32` 组字节 |
+| `__dyld[1]` 被.crt 置零崩溃 | 真实 dyld 代码区可写，我们的只读 | 可写 shim 页 |
+| NULL 函数指针调用 | `_errno` 等数据符号未提供存储 | errno 页 |
+| bsearch 全部选项 unknown | `findlongopt` 用 libc bsearch + 客户机回调 | 陷阱往返实现客户机回调 |
+| pc=0 "干净停止" | `emu_start(begin=0, until=0)` 的 until=0 即停止地址 | until 哨兵改为 1；空调用拦截返回 r3=0 |
+
+### 当前状态
+
+- **`curl -V` 完整成功**：输出 "curl 8.12.1 (powerpc-apple-darwin8) libcurl/8.12.1 OpenSSL/3.6.1 zlib/1.2.5"，exit 0。
+- **`curl --help`、参数解析、配置构建全部工作**（bsearch 往返生效）。
+- **HTTP/file 请求仍退出 27（CURLE_OUT_OF_MEMORY）**：发生在 `operate()` 的 `curl_share_init()` 之后、`curl_easy_init` 之前，无任何分配失败记录（HLE 层无 NULL 返回、无堆耗尽），疑似 libcurl 内部（share/互斥或 OpenSSL 惰性初始化）路径依赖未实现的宿主行为。这是下一个会话的第一调查点。
+- 回归：CTest 5/5 通过。
+
+### 下一步（按优先级）
+
+1. 定位 share-init 静默失败：在 HLE 层对照 libcurl share.c 源码逐步验证；怀疑 `Curl_mutex_init`/`curl_share_setopt` 语义。
+2. 打通 resolver：验证同步 pthread 机制与 threaded resolver 的兼容性（`Curl_thread_create` → 同步执行 → done 标志）。
+3. HTTP GET 127.0.0.1 端到端（socket/connect/send/recv 已就绪）。
+4. qsort 的客户机回调实现（bsearch 同款机制复用）。

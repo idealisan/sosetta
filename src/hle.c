@@ -21,6 +21,8 @@
 #include <unistd.h>
 
 #define MISC_BASE   0x7E100000u
+#define SHIM_BASE   0x7E400000u
+#define SHIM_SIZE   0x1000u
 #define MISC_SIZE   0x1000u
 #define RUNE_BASE   0x7E200000u
 #define RUNE_SIZE   0x2000u
@@ -51,7 +53,33 @@ typedef struct hle_env {
     uint32_t ret_hi;
     int has_fret;
     double fret;
+    int has_redirect;
+    uint32_t redirect_pc;
+    uint32_t call_r3;
+    uint32_t call_r4;
+    uint32_t call_lr;
 } hle_env;
+
+#define TRAP_BSEARCH_RET (HLE_TRAP_BASE + 4u * 0x3FFu)
+
+static struct bsearch_state {
+    int active;
+    uint32_t key;
+    uint32_t base;
+    uint32_t size;
+    uint32_t compar;
+    uint32_t orig_lr;
+    int lo;
+    int hi;
+    int mid;
+} bs;
+
+static struct pthread_sync_state {
+    int active;
+    uint32_t caller_lr;
+} pts;
+
+#define TRAP_PTHREAD_RET (HLE_TRAP_BASE + 4u * 0x3FEu)
 
 static int trace_state = -1;
 
@@ -67,6 +95,29 @@ static int g_read(sosetta_guest *g, uint32_t addr, void *buf, size_t n)
 {
     return sosetta_guest_read(g, addr, buf, n);
 }
+
+static uint32_t hle_image_header;
+
+static int g_write(sosetta_guest *g, uint32_t addr, const void *buf, size_t n);
+
+#define SHIM_RET1   (SHIM_BASE + 0x40u)
+#define SHIM_RET0   (SHIM_BASE + 0x60u)
+#define TRAP_HEADER (HLE_TRAP_BASE + 4u * 0x3Fu)
+#define TRAP_NAME   (HLE_TRAP_BASE + 4u * 0x3Eu)
+
+static void hle_dyld_get_image_header(hle_env *e)
+{
+    e->ret = hle_image_header;
+}
+
+static void hle_dyld_get_image_name(hle_env *e)
+{
+    static const char nm[] = "program";
+    g_write(e->g, GAI_ADDR + 32u, nm, sizeof(nm));
+    e->ret = GAI_ADDR + 32u;
+}
+
+static void hle_dyld_func_lookup(hle_env *e);
 
 static int g_write(sosetta_guest *g, uint32_t addr, const void *buf, size_t n)
 {
@@ -143,7 +194,10 @@ static uint32_t halloc(sosetta_guest *g, uint32_t n)
     uint32_t cur;
     uint8_t hdr[8];
 
-    if (need < 8u) {
+    if (need < 8u || need > HEAP_SIZE) {
+        if (trace_enabled()) {
+            fprintf(stderr, "[sosetta] halloc REJECT n=%u need=%u\n", n, need);
+        }
         return 0;
     }
     if (heap_free_head == 0) {
@@ -188,13 +242,21 @@ static uint32_t halloc(sosetta_guest *g, uint32_t n)
         prev = cur;
         cur = next;
     }
+    if (trace_enabled()) {
+        fprintf(stderr, "[sosetta] halloc FAIL n=%u need=%u\n", n, need);
+    }
     return 0;
 }
 
 static void hfree(sosetta_guest *g, uint32_t p)
 {
     uint8_t hdr[8];
+    uint8_t w4[4];
     uint32_t h;
+    uint32_t size;
+    uint32_t prev;
+    uint32_t cur;
+    uint32_t next;
 
     if (p == 0 || p < HEAP_BASE + 8u || p >= HEAP_BASE + HEAP_SIZE) {
         return;
@@ -203,11 +265,124 @@ static void hfree(sosetta_guest *g, uint32_t p)
     if (g_read(g, h, hdr, 4) != 0) {
         return;
     }
-    put_be32(hdr, be32(hdr) & ~1u);
-    put_be32(hdr + 4, heap_free_head);
+    size = be32(hdr) & ~1u;
+    prev = 0;
+    cur = heap_free_head;
+    while (cur != 0 && cur < h) {
+        uint32_t curn;
+        if (g_read(g, cur + 4, w4, 4) != 0) {
+            return;
+        }
+        curn = be32(w4);
+        prev = cur;
+        cur = curn;
+    }
+    if (g_read(g, cur, hdr, 8) == 0 && cur != 0) {
+        return;
+    }
+    next = (cur != 0) ? be32(hdr + 4) : 0;
+    if (cur != 0) {
+        uint8_t full[8];
+        if (g_read(g, cur, full, 8) != 0) {
+            return;
+        }
+        next = be32(full + 4);
+    }
+    put_be32(hdr, size);
+    put_be32(hdr + 4, cur);
     g_write(g, h, hdr, 8);
-    heap_free_head = h;
+    if (prev == 0) {
+        heap_free_head = h;
+    } else {
+        uint8_t p4[4];
+        put_be32(p4, h);
+        g_write(g, prev + 4, p4, 4);
+    }
+    if (cur != 0 && h + size == cur) {
+        uint8_t c[8];
+        if (g_read(g, cur, c, 8) == 0) {
+            return;
+        }
+        size += be32(c);
+        put_be32(hdr, size);
+        put_be32(hdr + 4, be32(c + 4));
+        g_write(g, h, hdr, 8);
+    }
+    if (prev != 0) {
+        uint8_t p8[8];
+        uint32_t psize;
+        if (g_read(g, prev, p8, 8) != 0) {
+            return;
+        }
+        psize = be32(p8);
+        if (prev + psize == h) {
+            put_be32(p8, psize + size);
+            put_be32(p8 + 4, next);
+            g_write(g, prev, p8, 8);
+        }
+    }
 }
+
+#define FDMAP_SIZE 256
+#define FDMAP_BASE 64
+
+static int fdmap[FDMAP_SIZE];
+static int fdmap_next = FDMAP_BASE;
+
+static int hle_host_fd(int gfd)
+{
+    if (gfd >= 0 && gfd < 3) {
+        return gfd;
+    }
+    if (gfd >= FDMAP_BASE && gfd < FDMAP_BASE + FDMAP_SIZE) {
+        return fdmap[gfd - FDMAP_BASE];
+    }
+    return -1;
+}
+
+int sosetta_hle_host_fd(int guest_fd)
+{
+    return hle_host_fd(guest_fd);
+}
+
+static int hle_alloc_gfd(int host_fd)
+{
+    int i;
+    for (i = 0; i < FDMAP_SIZE; i++) {
+        int slot = (fdmap_next - FDMAP_BASE + i) % FDMAP_SIZE;
+        if (fdmap[slot] == -1) {
+            fdmap[slot] = host_fd;
+            fdmap_next = FDMAP_BASE + slot + 1;
+            return FDMAP_BASE + slot;
+        }
+    }
+    return -1;
+}
+
+static void hle_free_gfd(int gfd)
+{
+    if (gfd >= FDMAP_BASE && gfd < FDMAP_BASE + FDMAP_SIZE) {
+        fdmap[gfd - FDMAP_BASE] = -1;
+    }
+}
+
+static void hle_socket_init(void)
+{
+    int i;
+    for (i = 0; i < FDMAP_SIZE; i++) {
+        fdmap[i] = -1;
+    }
+    fdmap_next = FDMAP_BASE;
+}
+
+#define SF_SLOTS 20
+#define SF_STRIDE 152u
+
+static FILE *sf_host[SF_SLOTS];
+static int sf_kind[SF_SLOTS];
+static int sf_eof[SF_SLOTS];
+static int sf_err[SF_SLOTS];
+static int sf_fd[SF_SLOTS];
 
 static int sf_slot_of(uint32_t gaddr)
 {
@@ -222,12 +397,6 @@ static int sf_slot_of(uint32_t gaddr)
 #define SF_KIND_FILE 2
 #define SF_KIND_DIR  3
 
-static FILE *sf_host[SF_SLOTS];
-static int sf_kind[SF_SLOTS];
-static int sf_eof[SF_SLOTS];
-static int sf_err[SF_SLOTS];
-static int sf_fd[SF_SLOTS];
-
 static int sf_take(void)
 {
     int i;
@@ -237,6 +406,364 @@ static int sf_take(void)
         }
     }
     return -1;
+}
+
+static void hle_socket(hle_env *e)
+{
+    int host_fd;
+    if (e->a[0] != 2u) {
+        hle_set_errno(e, 43);
+        e->ret = gerr(43);
+        return;
+    }
+    host_fd = socket(AF_INET, (int)(e->a[1] & 0xFFu), 0);
+    if (host_fd < 0) {
+        hle_set_errno(e, 78);
+        e->ret = gerr(78);
+        return;
+    }
+    {
+        int gfd = hle_alloc_gfd(host_fd);
+        if (gfd < 0) {
+            close(host_fd);
+            hle_set_errno(e, 24);
+            e->ret = gerr(24);
+            return;
+        }
+        e->ret = (uint32_t)gfd;
+    }
+}
+
+static void hle_connect(hle_env *e)
+{
+    int host_fd = hle_host_fd((int)(int32_t)e->a[0]);
+    uint8_t sa[16];
+    struct sockaddr_in sin;
+    if (host_fd < 0) {
+        hle_set_errno(e, 9);
+        e->ret = gerr(9);
+        return;
+    }
+    if (g_read(e->g, e->a[1], sa, 16) != 0) {
+        hle_set_errno(e, 14);
+        e->ret = gerr(14);
+        return;
+    }
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    memcpy(&sin.sin_port, sa + 2, 2);
+    memcpy(&sin.sin_addr, sa + 4, 4);
+    if (connect(host_fd, (struct sockaddr *)&sin, sizeof(sin)) != 0) {
+        hle_set_errno(e, (uint32_t)sosetta_syscall_errno_to_darwin(errno));
+        e->ret = gerr(78);
+        return;
+    }
+    e->ret = 0;
+}
+
+static void hle_send(hle_env *e)
+{
+    int host_fd = hle_host_fd((int)(int32_t)e->a[0]);
+    static uint8_t tmp[1u << 20];
+    uint32_t n = e->a[2];
+    ssize_t r;
+    if (host_fd < 0) {
+        hle_set_errno(e, 9);
+        e->ret = gerr(9);
+        return;
+    }
+    if (n > sizeof(tmp)) {
+        n = sizeof(tmp);
+    }
+    if (n && g_read(e->g, e->a[1], tmp, n) != 0) {
+        hle_set_errno(e, 14);
+        e->ret = gerr(14);
+        return;
+    }
+    r = send(host_fd, tmp, n, (int)e->a[3]);
+    if (r < 0) {
+        hle_set_errno(e, (uint32_t)sosetta_syscall_errno_to_darwin(errno));
+        e->ret = gerr(78);
+        return;
+    }
+    e->ret = (uint32_t)r;
+}
+
+static void hle_recv(hle_env *e)
+{
+    int host_fd = hle_host_fd((int)(int32_t)e->a[0]);
+    static uint8_t tmp[1u << 20];
+    uint32_t n = e->a[2];
+    ssize_t r;
+    if (host_fd < 0) {
+        hle_set_errno(e, 9);
+        e->ret = gerr(9);
+        return;
+    }
+    if (n > sizeof(tmp)) {
+        n = sizeof(tmp);
+    }
+    r = recv(host_fd, tmp, n, (int)e->a[3]);
+    if (r < 0) {
+        hle_set_errno(e, (uint32_t)sosetta_syscall_errno_to_darwin(errno));
+        e->ret = gerr(78);
+        return;
+    }
+    if (r > 0) {
+        g_write(e->g, e->a[1], tmp, (size_t)r);
+    }
+    e->ret = (uint32_t)r;
+}
+
+static void hle_close_socket(hle_env *e)
+{
+    int host_fd = hle_host_fd((int)(int32_t)e->a[0]);
+    if (host_fd >= 0 && e->a[0] >= FDMAP_BASE) {
+        close(host_fd);
+        hle_free_gfd((int)(int32_t)e->a[0]);
+        e->ret = 0;
+        return;
+    }
+    {
+        uint32_t args[4] = { e->a[0], 0, 0, 0 };
+        route_bsd(e, DARWIN_SYS_close, args);
+    }
+}
+
+static void hle_getsockopt(hle_env *e)
+{
+    if (e->a[1] == 0xFFFFu && e->a[2] == 0x1007u && e->a[4]) {
+        uint32_t zero = 0;
+        uint32_t four = 4;
+        g_write(e->g, e->a[4], &zero, 4);
+        if (e->a[5]) {
+            g_write(e->g, e->a[5], &four, 4);
+        }
+        e->ret = 0;
+        return;
+    }
+    e->ret = 0;
+}
+
+static void hle_select(hle_env *e)
+{
+    fd_set rfds;
+    fd_set wfds;
+    fd_set *rp = NULL;
+    fd_set *wp = NULL;
+    uint8_t gset[128];
+    struct timeval tv;
+    uint32_t sec;
+    uint32_t usec;
+    int r;
+    int gfd;
+    int host;
+    uint32_t addrs[3];
+    int i;
+
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    addrs[0] = e->a[1];
+    addrs[1] = e->a[2];
+    addrs[2] = e->a[3];
+    for (i = 0; i < 2; i++) {
+        if (!addrs[i]) {
+            continue;
+        }
+        memset(gset, 0, sizeof(gset));
+        if (g_read(e->g, addrs[i], gset, 128) != 0) {
+            continue;
+        }
+        for (gfd = 0; gfd < FDMAP_BASE + FDMAP_SIZE; gfd++) {
+            if (!(gset[gfd >> 3] & (1u << (gfd & 7u)))) {
+                continue;
+            }
+            host = hle_host_fd(gfd);
+            if (host < 0 || host >= 1024) {
+                continue;
+            }
+            if (i == 0) {
+                FD_SET(host, &rfds);
+                rp = &rfds;
+            } else {
+                FD_SET(host, &wfds);
+                wp = &wfds;
+            }
+        }
+    }
+    sec = 0;
+    usec = 0;
+    if (e->a[4]) {
+        uint8_t tmp[8];
+        if (g_read(e->g, e->a[4], tmp, 8) == 0) {
+            sec = be32(tmp);
+            usec = be32(tmp + 4);
+        }
+        tv.tv_sec = (time_t)sec;
+        tv.tv_usec = (suseconds_t)usec;
+    }
+    r = select(1024, rp, wp, NULL, e->a[4] ? &tv : NULL);
+    if (r < 0) {
+        hle_set_errno(e, (uint32_t)sosetta_syscall_errno_to_darwin(errno));
+        e->ret = gerr(78);
+        return;
+    }
+    for (i = 0; i < 2; i++) {
+        fd_set *hs = (i == 0) ? rp : wp;
+        if (!addrs[i]) {
+            continue;
+        }
+        memset(gset, 0, 128);
+        if (hs) {
+            for (gfd = 0; gfd < FDMAP_BASE + FDMAP_SIZE; gfd++) {
+                host = hle_host_fd(gfd);
+                if (host < 0 || host >= 1024) {
+                    continue;
+                }
+                if (FD_ISSET(host, hs)) {
+                    gset[gfd >> 3] |= (uint8_t)(1u << (gfd & 7u));
+                }
+            }
+        }
+        g_write(e->g, addrs[i], gset, 128);
+    }
+    e->ret = (uint32_t)r;
+}
+
+static void hle_write_darwin_stat(hle_env *e, uint32_t buf, struct stat *st)
+{
+    uint8_t tmp[108];
+    memset(tmp, 0, sizeof(tmp));
+    put_be32(tmp, (uint32_t)st->st_dev);
+    put_be32(tmp + 4, (uint32_t)st->st_ino);
+    put_be16(tmp + 8, (uint16_t)st->st_mode);
+    put_be16(tmp + 10, (uint16_t)st->st_nlink);
+    put_be32(tmp + 12, (uint32_t)st->st_uid);
+    put_be32(tmp + 16, (uint32_t)st->st_gid);
+    put_be32(tmp + 20, (uint32_t)st->st_rdev);
+    put_be32(tmp + 28, (uint32_t)st->st_mtim.tv_sec);
+    put_be32(tmp + 32, (uint32_t)st->st_mtim.tv_nsec * 1000u);
+    put_be32(tmp + 36, (uint32_t)st->st_ctim.tv_sec);
+    put_be32(tmp + 40, (uint32_t)st->st_ctim.tv_nsec * 1000u);
+    put_be64(tmp + 48, (uint64_t)st->st_size);
+    put_be32(tmp + 60, (uint32_t)st->st_blksize);
+    put_be32(tmp + 64, (uint32_t)(st->st_blocks * 8u));
+    g_write(e->g, buf, tmp, sizeof(tmp));
+}
+
+static void hle_fstat(hle_env *e)
+{
+    int host_fd = hle_host_fd((int)(int32_t)e->a[0]);
+    struct stat st;
+    if (host_fd < 0 || fstat(host_fd, &st) != 0) {
+        hle_set_errno(e, 9);
+        e->ret = gerr(9);
+        return;
+    }
+    hle_write_darwin_stat(e, e->a[1], &st);
+    e->ret = 0;
+}
+
+static void hle_stat(hle_env *e)
+{
+    char path[4096];
+    struct stat st;
+    g_read_str(e->g, e->a[0], path, sizeof(path));
+    if (stat(path, &st) != 0) {
+        hle_set_errno(e, (uint32_t)sosetta_syscall_errno_to_darwin(errno));
+        e->ret = gerr(2);
+        return;
+    }
+    hle_write_darwin_stat(e, e->a[1], &st);
+    e->ret = 0;
+}
+
+static void hle_getaddrinfo(hle_env *e)
+{
+    char node[256];
+    char service[64];
+    uint8_t hints[32];
+    int family = 0;
+    uint32_t ai_ptr;
+    uint32_t sa_ptr;
+    uint8_t ai[32];
+    uint8_t sa[16];
+    unsigned long port = 0;
+    struct in_addr addr4;
+
+    if (!e->a[0] || !e->a[3]) {
+        e->ret = 8;
+        return;
+    }
+    g_read_str(e->g, e->a[0], node, sizeof(node));
+    if (e->a[1]) {
+        g_read_str(e->g, e->a[1], service, sizeof(service));
+        port = strtoul(service, NULL, 10);
+    }
+    memset(hints, 0, sizeof(hints));
+    if (e->a[2]) {
+        g_read(e->g, e->a[2], hints, 32);
+        family = (int)(int32_t)be32(hints + 4);
+    }
+    if (family != 0 && family != 2) {
+        e->ret = 9;
+        return;
+    }
+    if (inet_pton(AF_INET, node, &addr4) != 1) {
+        e->ret = 8;
+        return;
+    }
+    ai_ptr = halloc(e->g, 32);
+    sa_ptr = halloc(e->g, 16);
+    if (!ai_ptr || !sa_ptr) {
+        e->ret = 12;
+        return;
+    }
+    memset(sa, 0, sizeof(sa));
+    sa[0] = 16;
+    sa[1] = 2;
+    put_be16(sa + 2, (uint16_t)(port & 0xFFFFu));
+    memcpy(sa + 4, &addr4, 4);
+    memset(ai, 0, sizeof(ai));
+    put_be32(ai + 4, 2);
+    put_be32(ai + 8, 1);
+    put_be32(ai + 16, 16);
+    put_be32(ai + 24, sa_ptr);
+    g_write(e->g, sa_ptr, sa, 16);
+    g_write(e->g, ai_ptr, ai, 32);
+    g_write(e->g, e->a[3], &ai_ptr, 4);
+    e->ret = 0;
+}
+
+static void hle_freeaddrinfo(hle_env *e)
+{
+    uint32_t ai_ptr = e->a[0];
+    uint32_t sa_ptr = 0;
+    uint8_t tmp[4];
+    if (ai_ptr && g_read(e->g, ai_ptr + 24u, tmp, 4) == 0) {
+        sa_ptr = be32(tmp);
+    }
+    if (sa_ptr) {
+        hfree(e->g, sa_ptr);
+    }
+    if (ai_ptr) {
+        hfree(e->g, ai_ptr);
+    }
+    e->ret = 0;
+}
+
+static void hle_fcntl_real(hle_env *e)
+{
+    int host_fd = hle_host_fd((int)(int32_t)e->a[0]);
+    if (host_fd < 0) {
+        e->ret = 0;
+        return;
+    }
+    if (e->a[1] == 4u) {
+        e->ret = 0;
+        return;
+    }
+    e->ret = (uint32_t)fcntl(host_fd, (int)e->a[1]);
 }
 
 static int sf_read(FILE *hf, int fd, void *buf, size_t n, size_t *got)
@@ -340,62 +867,59 @@ static void vfmt(hle_env *e, fmt_target *t, uint32_t fmt_addr, unsigned vi)
     if (g_read_str(e->g, fmt_addr, fmt, sizeof(fmt)) != 0) {
         return;
     }
-    while (fmt[i] != '\0') {
-        if (fmt[i] != '%') {
+    while (fmt[i] != 0) {
+        if (fmt[i] != 37) {
             obuf_add(&fmt[i], 1);
             i++;
             continue;
         }
         {
             char spec[32];
-            size_t s = 0;
+            char tmp[512];
+            size_t sp = 0;
             size_t j = i;
             int kind = 0;
-            char tmp[512];
             uint32_t av;
             double dv = 0.0;
 
-            spec[s++] = '%';
+            spec[sp++] = 37;
             j++;
-            while (strchr("-+ #0", fmt[j]) && fmt[j] != '\0' && s < sizeof(spec) - 8) {
-                spec[s++] = fmt[j++];
+            while (j < sizeof(fmt) && strchr("-+ #0", fmt[j]) != NULL &&
+                   fmt[j] != 0 && sp < sizeof(spec) - 8) {
+                spec[sp++] = fmt[j++];
             }
-            while ((isdigit((unsigned char)fmt[j]) || fmt[j] == '*') &&
-                   s < sizeof(spec) - 8) {
-                if (fmt[j] == '*') {
+            while (j < sizeof(fmt) && (isdigit((unsigned char)fmt[j]) || fmt[j] == 42) &&
+                   sp < sizeof(spec) - 8) {
+                if (fmt[j] == 42) {
                     av = arg_at(e, vi);
                     vi++;
-                    s += (size_t)snprintf(spec + s, sizeof(spec) - s, "%u", av);
+                    sp += (size_t)snprintf(spec + sp, sizeof(spec) - sp, "%u", av);
                 } else {
-                    spec[s++] = fmt[j];
+                    spec[sp++] = fmt[j];
                 }
                 j++;
             }
-            if (fmt[j] == '.' && s < sizeof(spec) - 8) {
-                spec[s++] = fmt[j++];
-                while ((isdigit((unsigned char)fmt[j]) || fmt[j] == '*') &&
-                       s < sizeof(spec) - 8) {
-                    if (fmt[j] == '*') {
+            if (fmt[j] == 46 && sp < sizeof(spec) - 8) {
+                spec[sp++] = fmt[j++];
+                while (j < sizeof(fmt) && (isdigit((unsigned char)fmt[j]) || fmt[j] == 42) &&
+                       sp < sizeof(spec) - 8) {
+                    if (fmt[j] == 42) {
                         av = arg_at(e, vi);
                         vi++;
-                        s += (size_t)snprintf(spec + s, sizeof(spec) - s, "%u", av);
+                        sp += (size_t)snprintf(spec + sp, sizeof(spec) - sp, "%u", av);
                     } else {
-                        spec[s++] = fmt[j];
+                        spec[sp++] = fmt[j];
                     }
                     j++;
                 }
             }
-            if (fmt[j] == 'l') {
-                spec[s++] = fmt[j++];
-                if (fmt[j] == 'l') {
-                    spec[s++] = fmt[j++];
-                }
-            } else if (fmt[j] == 'h' || fmt[j] == 'L') {
-                spec[s++] = fmt[j++];
+            while ((fmt[j] == 'l' || fmt[j] == 'h' || fmt[j] == 'L') &&
+                   sp < sizeof(spec) - 8) {
+                spec[sp++] = fmt[j++];
             }
             switch (fmt[j]) {
             case 'd': case 'i':
-                if (spec[1] == 'l' && spec[2] == 'l') {
+                if (sp >= 3 && spec[1] == 'l' && spec[2] == 'l') {
                     uint32_t lo = arg_at(e, vi);
                     uint32_t hi = arg_at(e, vi + 1);
                     long long v64 = ((long long)hi << 32) | lo;
@@ -450,7 +974,7 @@ static void vfmt(hle_env *e, fmt_target *t, uint32_t fmt_addr, unsigned vi)
                 kind = 1;
                 break;
             }
-            case '%':
+            case 37:
                 obuf_add("%", 1);
                 i = j + 1;
                 continue;
@@ -601,6 +1125,13 @@ static void hle_strncat(hle_env *e)
 
 static void hle_strcmp(hle_env *e)
 {
+    if (trace_enabled()) {
+        char a1[64];
+        char a2[64];
+        g_read_str(e->g, e->a[0], a1, sizeof(a1));
+        g_read_str(e->g, e->a[1], a2, sizeof(a2));
+        fprintf(stderr, "[sosetta] strcmp(%.40s, %.40s)\n", a1, a2);
+    }
     char s1[65536];
     char s2[65536];
     g_read_str(e->g, e->a[0], s1, sizeof(s1));
@@ -610,6 +1141,13 @@ static void hle_strcmp(hle_env *e)
 
 static void hle_strncmp(hle_env *e)
 {
+    if (trace_enabled()) {
+        char a1[64];
+        char a2[64];
+        g_read_str(e->g, e->a[0], a1, sizeof(a1));
+        g_read_str(e->g, e->a[1], a2, sizeof(a2));
+        fprintf(stderr, "[sosetta] strcasecmp(%.40s, %.40s)\n", a1, a2);
+    }
     static char s1[65536];
     static char s2[65536];
     uint32_t n = e->a[2] > sizeof(s1) ? sizeof(s1) : e->a[2];
@@ -622,6 +1160,13 @@ static void hle_strncmp(hle_env *e)
 
 static void hle_strcasecmp(hle_env *e)
 {
+    if (trace_enabled()) {
+        char a1[64];
+        char a2[64];
+        g_read_str(e->g, e->a[0], a1, sizeof(a1));
+        g_read_str(e->g, e->a[1], a2, sizeof(a2));
+        fprintf(stderr, "[sosetta] strcasecmp(%.40s, %.40s)\n", a1, a2);
+    }
     char s1[65536];
     char s2[65536];
     g_read_str(e->g, e->a[0], s1, sizeof(s1));
@@ -631,6 +1176,13 @@ static void hle_strcasecmp(hle_env *e)
 
 static void hle_strncasecmp(hle_env *e)
 {
+    if (trace_enabled()) {
+        char a1[64];
+        char a2[64];
+        g_read_str(e->g, e->a[0], a1, sizeof(a1));
+        g_read_str(e->g, e->a[1], a2, sizeof(a2));
+        fprintf(stderr, "[sosetta] strcmp(%.40s, %.40s)\n", a1, a2);
+    }
     static char s1[65536];
     static char s2[65536];
     uint32_t n = e->a[2] > sizeof(s1) ? sizeof(s1) : e->a[2];
@@ -824,6 +1376,10 @@ static void hle_strtod(hle_env *e)
 static void hle_malloc(hle_env *e)
 {
     e->ret = halloc(e->g, e->a[0]);
+    if (trace_enabled()) {
+        fprintf(stderr, "[sosetta] malloc(%u) = 0x%08x", e->a[0], e->ret);
+        fputc(10, stderr);
+    }
 }
 
 static void hle_calloc(hle_env *e)
@@ -1600,9 +2156,168 @@ static void hle_printf(hle_env *e)
     e->ret = 0;
 }
 
+struct va_list_ppc {
+    uint32_t reg_save_area;
+    uint32_t overflow_arg_area;
+    uint32_t gpr_offs;
+    uint32_t fpr_offs;
+};
+
+static uint32_t va_next(hle_env *e, struct va_list_ppc *va, int is_double)
+{
+    uint32_t v = 0;
+
+    if (is_double) {
+        uint32_t area = va->reg_save_area + 32u + va->fpr_offs * 8u;
+        uint64_t bits = 0;
+        if (va->fpr_offs < 13 && g_read(e->g, area, &bits, 8) == 0) {
+            memcpy(&v, &bits, 4);
+        }
+        va->fpr_offs++;
+        return v;
+    }
+    if (va->gpr_offs < 8) {
+        uint32_t area = va->reg_save_area + va->gpr_offs * 4u;
+        g_read(e->g, area, &v, 4);
+        va->gpr_offs++;
+        return v;
+    }
+    g_read(e->g, va->overflow_arg_area, &v, 4);
+    va->overflow_arg_area += 4u;
+    return v;
+}
+
+static void vfmt_va(hle_env *e, fmt_target *t, uint32_t fmt_addr,
+                    uint32_t va_ptr)
+{
+    struct va_list_ppc va;
+    char fmt[8192];
+    size_t i = 0;
+
+    obuf_reset();
+    if (va_ptr == 0 || g_read(e->g, va_ptr, &va, sizeof(va)) != 0) {
+        return;
+    }
+    if (g_read_str(e->g, fmt_addr, fmt, sizeof(fmt)) != 0) {
+        return;
+    }
+    while (fmt[i] != 0) {
+        if (fmt[i] != 37) {
+            obuf_add(&fmt[i], 1);
+            i++;
+            continue;
+        }
+        {
+            char spec[32];
+            char tmp[512];
+            size_t sp = 0;
+            size_t j = i;
+            int kind = 0;
+            uint32_t av;
+            double dv = 0.0;
+            uint64_t dbits = 0;
+
+            spec[sp++] = 37;
+            j++;
+            while (j < sizeof(fmt) && strchr("-+ #0", fmt[j]) != NULL &&
+                   fmt[j] != 0 && sp < sizeof(spec) - 8) {
+                spec[sp++] = fmt[j++];
+            }
+            while (j < sizeof(fmt) && isdigit((unsigned char)fmt[j]) &&
+                   sp < sizeof(spec) - 8) {
+                spec[sp++] = fmt[j++];
+            }
+            if (fmt[j] == 46 && sp < sizeof(spec) - 8) {
+                spec[sp++] = fmt[j++];
+                while (j < sizeof(fmt) && isdigit((unsigned char)fmt[j]) &&
+                       sp < sizeof(spec) - 8) {
+                    spec[sp++] = fmt[j++];
+                }
+            }
+            while ((fmt[j] == 'l' || fmt[j] == 'h' || fmt[j] == 'L') &&
+                   sp < sizeof(spec) - 8) {
+                spec[sp++] = fmt[j++];
+            }
+            switch (fmt[j]) {
+            case 'd': case 'i':
+                av = va_next(e, &va, 0);
+                snprintf(tmp, sizeof(tmp), spec, (int)(int32_t)av);
+                kind = 1;
+                break;
+            case 'u': case 'x': case 'X': case 'o':
+                av = va_next(e, &va, 0);
+                snprintf(tmp, sizeof(tmp), spec, av);
+                kind = 1;
+                break;
+            case 'c':
+                av = va_next(e, &va, 0);
+                snprintf(tmp, sizeof(tmp), spec, (int)(av & 0xFFu));
+                kind = 1;
+                break;
+            case 'p':
+                av = va_next(e, &va, 0);
+                snprintf(tmp, sizeof(tmp), spec, (uintptr_t)av);
+                kind = 1;
+                break;
+            case 's': {
+                char sbuf[4096];
+                av = va_next(e, &va, 0);
+                if (av == 0) {
+                    snprintf(tmp, sizeof(tmp), "(null)");
+                } else {
+                    g_read_str(e->g, av, sbuf, sizeof(sbuf));
+                    snprintf(tmp, sizeof(tmp), spec, sbuf);
+                }
+                kind = 1;
+                break;
+            }
+            case 'f': case 'F': case 'e': case 'E':
+            case 'g': case 'G': {
+                uint32_t area = va.reg_save_area + 32u + va.fpr_offs * 8u;
+                g_read(e->g, area, &dbits, 8);
+                memcpy(&dv, &dbits, sizeof(dv));
+                va.fpr_offs++;
+                va.gpr_offs += 2;
+                snprintf(tmp, sizeof(tmp), spec, dv);
+                kind = 1;
+                break;
+            }
+            case 37:
+                obuf_add("%", 1);
+                i = j + 1;
+                continue;
+            default:
+                obuf_add(&fmt[i], j - i + 1);
+                i = j + 1;
+                continue;
+            }
+            if (kind) {
+                obuf_add(tmp, strlen(tmp));
+            }
+            i = j + 1;
+        }
+    }
+    fmt_flush(t);
+}
+
 static void hle_vfprintf(hle_env *e)
 {
-    (void)e;
+    FILE *hf;
+    int fd;
+    int *eof;
+    int *err;
+    fmt_target t;
+    if (sf_get_stream(e, e->a[0], &hf, &fd, &eof, &err) != 0) {
+        e->ret = gerr(9);
+        return;
+    }
+    t.kind = 1;
+    t.g = e->g;
+    t.hf = hf;
+    t.fd = fd;
+    t.gbuf = 0;
+    t.gcap = 0;
+    vfmt_va(e, &t, e->a[1], e->a[2]);
     e->ret = 0;
 }
 
@@ -1762,9 +2477,14 @@ static void hle_inflate_init(hle_env *e)
 
 static void hle_pthread_create(hle_env *e)
 {
-    (void)e;
-    hle_set_errno(e, 11);
-    e->ret = 11;
+    uint32_t lr = 0;
+    uc_reg_read(e->g->uc, UC_PPC_REG_LR, &lr);
+    pts.active = 1;
+    pts.caller_lr = lr;
+    e->has_redirect = 1;
+    e->redirect_pc = e->a[2];
+    e->call_r3 = e->a[3];
+    e->call_lr = TRAP_PTHREAD_RET;
 }
 
 static void hle_pthread_self(hle_env *e)
@@ -1831,8 +2551,78 @@ static void hle_setlocale(hle_env *e)
 
 static void hle_bsearch(hle_env *e)
 {
-    (void)e;
-    e->ret = 0;
+    uint32_t lr = 0;
+    uc_reg_read(e->g->uc, UC_PPC_REG_LR, &lr);
+    bs.key = e->a[0];
+    bs.base = e->a[1];
+    bs.size = e->a[3];
+    bs.compar = e->a[4];
+    bs.orig_lr = lr;
+    bs.lo = 0;
+    bs.hi = (int)e->a[2] - 1;
+    bs.active = 1;
+    if (trace_enabled()) {
+        fprintf(stderr, "[sosetta] bsearch key=%u base=%u n=%u size=%u compar=%u lr=%u\n",
+                bs.key, bs.base, (unsigned)(bs.hi + 1), bs.size, bs.compar, lr);
+    }
+    if (bs.hi < bs.lo) {
+        bs.active = 0;
+        e->ret = 0;
+        return;
+    }
+    bs.mid = bs.lo + (bs.hi - bs.lo) / 2;
+    e->has_redirect = 1;
+    e->redirect_pc = bs.compar;
+    e->call_r3 = bs.key;
+    e->call_r4 = bs.base + (uint32_t)bs.mid * bs.size;
+}
+
+static void hle_bsearch_return(hle_env *e)
+{
+    uint32_t r3 = 0;
+    uint32_t r4keep = 0;
+    uint32_t elem;
+    sosetta_guest_get_gpr(e->g, 3, &r3);
+    sosetta_guest_get_gpr(e->g, 4, &r4keep);
+    e->has_redirect = 1;
+    if (!bs.active) {
+        e->redirect_pc = bs.orig_lr;
+        e->call_r3 = e->ret;
+        e->call_r4 = r4keep;
+        return;
+    }
+    elem = bs.base + (uint32_t)bs.mid * bs.size;
+    if (r3 == 0) {
+        bs.active = 0;
+        e->ret = elem;
+        if (trace_enabled()) {
+            fprintf(stderr, "[sosetta] bsearch found elem=%u lr_resume=%u\n", elem, bs.orig_lr);
+        }
+        e->redirect_pc = bs.orig_lr;
+        e->call_r3 = elem;
+        e->call_r4 = r4keep;
+        return;
+    }
+    if ((int32_t)r3 < 0) {
+        bs.hi = bs.mid - 1;
+    } else {
+        bs.lo = bs.mid + 1;
+    }
+    if (bs.lo > bs.hi) {
+        bs.active = 0;
+        e->ret = 0;
+        if (trace_enabled()) {
+            fprintf(stderr, "[sosetta] bsearch exhausted lr_resume=%u\n", bs.orig_lr);
+        }
+        e->redirect_pc = bs.orig_lr;
+        e->call_r3 = 0;
+        e->call_r4 = r4keep;
+        return;
+    }
+    bs.mid = bs.lo + (bs.hi - bs.lo) / 2;
+    e->redirect_pc = bs.compar;
+    e->call_r3 = bs.key;
+    e->call_r4 = bs.base + (uint32_t)bs.mid * bs.size;
 }
 
 static void hle_qsort(hle_env *e)
@@ -1849,39 +2639,6 @@ static void hle_ftruncate(hle_env *e)
 
 #define FN(name) static void hle_##name(hle_env *e)
 
-FN(socket) { (void)e; e->ret = gerr(78); }
-FN(bind) { (void)e; e->ret = gerr(78); }
-FN(listen) { (void)e; e->ret = gerr(78); }
-FN(accept) { (void)e; e->ret = gerr(78); }
-FN(connect) { (void)e; e->ret = gerr(78); }
-FN(shutdown) { (void)e; e->ret = gerr(78); }
-FN(setsockopt) { (void)e; e->ret = gerr(78); }
-FN(getsockopt) { (void)e; e->ret = gerr(78); }
-FN(getsockname) { (void)e; e->ret = gerr(78); }
-FN(getpeername) { (void)e; e->ret = gerr(78); }
-FN(send) { (void)e; e->ret = gerr(78); }
-FN(sendto) { (void)e; e->ret = gerr(78); }
-FN(recv) { (void)e; e->ret = gerr(78); }
-FN(recvfrom) { (void)e; e->ret = gerr(78); }
-FN(sendmsg) { (void)e; e->ret = gerr(78); }
-FN(recvmsg) { (void)e; e->ret = gerr(78); }
-FN(socketpair) { (void)e; e->ret = gerr(78); }
-FN(pipe) { (void)e; e->ret = gerr(78); }
-FN(poll) { (void)e; e->ret = gerr(78); }
-FN(select) { (void)e; e->ret = gerr(78); }
-FN(ioctl) { (void)e; e->ret = gerr(78); }
-FN(fcntl) { (void)e; e->ret = gerr(78); }
-FN(getaddrinfo) { (void)e; e->ret = 8; }
-FN(freeaddrinfo) { (void)e; e->ret = 0; }
-FN(getnameinfo) { (void)e; e->ret = 8; }
-FN(freeifaddrs) { (void)e; e->ret = 0; }
-FN(getifaddrs) { (void)e; e->ret = gerr(78); }
-FN(if_nametoindex) { (void)e; e->ret = 0; }
-FN(dladdr) { (void)e; e->ret = 0; }
-FN(dlclose) { (void)e; e->ret = 0; }
-FN(dlerror) { (void)e; e->ret = 0; }
-FN(dlopen) { (void)e; e->ret = 0; }
-FN(dlsym) { (void)e; e->ret = 0; }
 FN(nanosleep) { (void)e; e->ret = 0; }
 FN(sched_yield) { (void)e; e->ret = 0; }
 FN(alarm) { (void)e; e->ret = 0; }
@@ -1893,6 +2650,12 @@ FN(tcsetattr) { (void)e; e->ret = gerr(25); }
 FN(once) { (void)e; e->ret = 0; }
 FN(inflate) { (void)e; e->ret = (uint32_t)-2; }
 FN(inflateEnd) { (void)e; e->ret = 0; }
+
+static void hle_enosys(hle_env *e)
+{
+    hle_set_errno(e, 78);
+    e->ret = gerr(78);
+}
 
 struct hle_entry {
     const char *name;
@@ -2046,44 +2809,59 @@ static const struct hle_entry hle_table[] = {
     { "_mlock", hle_mlock },
     { "_fsetxattr", hle_fsetxattr },
     { "_socket", hle_socket },
-    { "_bind", hle_bind },
-    { "_listen", hle_listen },
-    { "_accept", hle_accept },
+    { "_bind", hle_enosys },
+    { "_listen", hle_enosys },
+    { "_accept", hle_enosys },
     { "_connect", hle_connect },
-    { "_shutdown", hle_shutdown },
-    { "_setsockopt", hle_setsockopt },
+    { "_shutdown", hle_enosys },
+    { "_setsockopt", hle_enosys },
     { "_getsockopt", hle_getsockopt },
-    { "_getsockname", hle_getsockname },
-    { "_getpeername", hle_getpeername },
+    { "_getsockname", hle_enosys },
+    { "_getpeername", hle_enosys },
     { "_send", hle_send },
-    { "_sendto", hle_sendto },
+    { "_sendto", hle_enosys },
     { "_recv", hle_recv },
-    { "_recvfrom", hle_recvfrom },
-    { "_sendmsg", hle_sendmsg },
-    { "_recvmsg", hle_recvmsg },
-    { "_socketpair", hle_socketpair },
-    { "_pipe", hle_pipe },
-    { "_poll", hle_poll },
+    { "_recvfrom", hle_enosys },
+    { "_sendmsg", hle_enosys },
+    { "_recvmsg", hle_enosys },
+    { "_socketpair", hle_enosys },
+    { "_pipe", hle_enosys },
+    { "_poll", hle_enosys },
     { "_select", hle_select },
-    { "_ioctl", hle_ioctl },
-    { "_fcntl", hle_fcntl },
+    { "_ioctl", hle_enosys },
+    { "_fcntl", hle_fcntl_real },
     { "_getaddrinfo", hle_getaddrinfo },
     { "_freeaddrinfo", hle_freeaddrinfo },
-    { "_getnameinfo", hle_getnameinfo },
-    { "_freeifaddrs", hle_freeifaddrs },
-    { "_getifaddrs", hle_getifaddrs },
-    { "_if_nametoindex", hle_if_nametoindex },
-    { "_dladdr", hle_dladdr },
-    { "_dlclose", hle_dlclose },
-    { "_dlerror", hle_dlerror },
-    { "_dlopen", hle_dlopen },
-    { "_dlsym", hle_dlsym },
+    { "_getnameinfo", hle_enosys },
+    { "_freeifaddrs", hle_enosys },
+    { "_getifaddrs", hle_enosys },
+    { "_if_nametoindex", hle_enosys },
+    { "_dladdr", hle_enosys },
+    { "_dlclose", hle_enosys },
+    { "_dlerror", hle_enosys },
+    { "_dlopen", hle_enosys },
+    { "_dlsym", hle_enosys },
     { "_getpwuid", hle_getpwuid },
     { "_getpwuid_r", hle_getpwuid_r },
     { "_gethostbyname", hle_gethostbyname },
     { "_sysctlbyname", hle_sysctlbyname },
     { "_setlocale", hle_setlocale },
+    { "_socket", hle_socket },
+    { "_connect", hle_connect },
+    { "_send", hle_send },
+    { "_recv", hle_recv },
+    { "_close", hle_close_socket },
+    { "_getsockopt", hle_getsockopt },
+    { "_select", hle_select },
+    { "_fstat", hle_fstat },
+    { "_stat", hle_stat },
+    { "_getaddrinfo", hle_getaddrinfo },
+    { "_freeaddrinfo", hle_freeaddrinfo },
+    { "_fcntl", hle_fcntl_real },
     { "_qsort", hle_qsort },
+    { "_dyld_func_lookup", hle_dyld_func_lookup },
+    { "__dyld_get_image_header", hle_dyld_get_image_header },
+    { "__dyld_get_image_name", hle_dyld_get_image_name },
     { "_bsearch", hle_bsearch },
 };
 
@@ -2102,6 +2880,29 @@ static int hle_lookup(const char *name)
 
 static uint32_t hle_ids_used;
 
+static void hle_dyld_func_lookup(hle_env *e)
+{
+    char name[256];
+    uint32_t target = SHIM_RET0;
+    g_read_str(e->g, e->a[0], name, sizeof(name));
+    if (trace_enabled()) {
+        fprintf(stderr, "[sosetta] dyld_func_lookup(%s)\n", name);
+    }
+    if (strcmp(name, "__dyld_image_count") == 0) {
+        target = SHIM_RET1;
+    } else if (strcmp(name, "__dyld_get_image_header") == 0) {
+        target = TRAP_HEADER;
+    } else if (strcmp(name, "__dyld_get_image_name") == 0) {
+        target = TRAP_NAME;
+    }
+    if (e->a[1]) {
+        uint8_t tmp[4];
+        put_be32(tmp, target);
+        g_write(e->g, e->a[1], tmp, 4);
+    }
+    e->ret = 0;
+}
+
 int sosetta_hle_bind(sosetta_guest *g, sosetta_syscall_ctx *ctx,
                      const sosetta_macho *im)
 {
@@ -2112,6 +2913,16 @@ int sosetta_hle_bind(sosetta_guest *g, sosetta_syscall_ctx *ctx,
         sosetta_guest_map(g, SF_BASE, SF_SIZE, VM_PROT_READ | VM_PROT_WRITE) != 0 ||
         sosetta_guest_map(g, HEAP_BASE, HEAP_SIZE, VM_PROT_READ | VM_PROT_WRITE) != 0) {
         return -1;
+    }
+    hle_socket_init();
+    {
+        uint32_t km_ptr = 0;
+        uint8_t tmp[4];
+        g_read(g, 0x56C580u, &km_ptr, 4);
+        if (km_ptr) {
+            put_be32(tmp, 0x8fe01000u);
+            g_write(g, km_ptr, tmp, 4);
+        }
     }
     ctx->errno_addr = ERRNO_ADDR;
     {
@@ -2183,6 +2994,8 @@ int sosetta_hle_bind(sosetta_guest *g, sosetta_syscall_ctx *ctx,
                     value = CTHREAD_ADDR;
                 } else if (strcmp(name, "_mach_init_routine") == 0) {
                     value = MACHINIT_ADDR;
+                } else if (strcmp(name, "_errno") == 0) {
+                    value = ERRNO_ADDR;
                 } else {
                     known = 0;
                 }
@@ -2192,6 +3005,42 @@ int sosetta_hle_bind(sosetta_guest *g, sosetta_syscall_ctx *ctx,
                     g_write(g, s->addr + 4u * k, tmp, 4);
                 }
             }
+        }
+    }
+    if (sosetta_guest_map(g, SHIM_BASE, SHIM_SIZE,
+                          VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXEC) == 0) {
+        uint8_t code[20];
+        size_t si;
+        put_be32(code, 0x3ca08fe0u);
+        put_be32(code + 4, 0x60a51000u);
+        put_be32(code + 8, 0x90a40000u);
+        put_be32(code + 12, 0x38600000u);
+        put_be32(code + 16, 0x4e800020u);
+        g_write(g, SHIM_BASE, code, sizeof(code));
+        put_be32(code, 0x38600001u);
+        put_be32(code + 4, 0x4e800020u);
+        g_write(g, SHIM_RET1, code, 8);
+        put_be32(code, 0x38600000u);
+        put_be32(code + 4, 0x4e800020u);
+        g_write(g, SHIM_RET0, code, 8);
+        for (si = 0; si < im->nsegs; si++) {
+            if (im->segs[si].filesize > 0) {
+                hle_image_header = (uint32_t)im->segs[si].vmaddr;
+                break;
+            }
+        }
+    }
+    for (i = 0; i < im->nsects; i++) {
+        const sosetta_sect *s = &im->sects[i];
+        if (strcmp(s->sectname, "__dyld") != 0) {
+            continue;
+        }
+        if (s->size >= 8u) {
+            uint8_t tmp[4];
+            put_be32(tmp, 0x8fe01000u);
+            g_write(g, s->addr, tmp, 4);
+            put_be32(tmp, SHIM_BASE);
+            g_write(g, s->addr + 4u, tmp, 4);
         }
     }
     return 0;
@@ -2209,7 +3058,8 @@ void sosetta_hle_set_errno(sosetta_guest *g, sosetta_syscall_ctx *ctx,
 }
 
 void sosetta_hle_call(sosetta_guest *g, sosetta_syscall_ctx *ctx,
-                      uint32_t id, const uint32_t *a, uint32_t *ret)
+                      uint32_t pc, uint32_t id, const uint32_t *a,
+                      uint32_t *ret, hle_env_public *out)
 {
     hle_env e;
     e.g = g;
@@ -2220,6 +3070,11 @@ void sosetta_hle_call(sosetta_guest *g, sosetta_syscall_ctx *ctx,
     e.ret_hi = 0;
     e.has_fret = 0;
     e.fret = 0;
+    e.has_redirect = 0;
+    e.redirect_pc = 0;
+    e.call_r3 = 0;
+    e.call_r4 = 0;
+    e.call_lr = TRAP_BSEARCH_RET;
     if (trace_enabled()) {
         uint32_t pc = 0;
         uint32_t lr = 0;
@@ -2228,13 +3083,28 @@ void sosetta_hle_call(sosetta_guest *g, sosetta_syscall_ctx *ctx,
         uc_reg_read(g->uc, UC_PPC_REG_LR, &lr);
         sosetta_guest_read(g, 0x570738u, &km, 4);
         fprintf(stderr,
-                "[sosetta] hle call id=%u %s (pc=0x%08x lr=0x%08x km=0x%08x)\n",
-                id, id < HLE_TABLE_N ? hle_table[id].name : "?", pc, lr, km);
+                "[sosetta] hle call id=%u %s (pc=0x%08x lr=0x%08x km=0x%08x r3=0x%08x)\n",
+                id, id < HLE_TABLE_N ? hle_table[id].name : "?", pc, lr, km,
+                a[0]);
     }
-    if (id < HLE_TABLE_N) {
+    if (pc == TRAP_PTHREAD_RET) {
+        if (pts.active) {
+            pts.active = 0;
+            e.has_redirect = 1;
+            e.redirect_pc = pts.caller_lr;
+            e.call_r3 = 0x2000u;
+        }
+    } else if (pc == TRAP_BSEARCH_RET) {
+        hle_bsearch_return(&e);
+    } else if (id < HLE_TABLE_N) {
         hle_table[id].fn(&e);
     } else {
         fprintf(stderr, "[sosetta] hle: no implementation for id %u\n", id);
+    }
+    if (trace_enabled()) {
+        fprintf(stderr,
+                "[sosetta] hle ret id=%u %s r3=0x%08x\n",
+                id, id < HLE_TABLE_N ? hle_table[id].name : "?", e.ret);
     }
     if (e.has_hi) {
         sosetta_guest_set_gpr(g, 4, e.ret_hi);
@@ -2244,5 +3114,10 @@ void sosetta_hle_call(sosetta_guest *g, sosetta_syscall_ctx *ctx,
         memcpy(&bits, &e.fret, sizeof(bits));
         uc_reg_write(g->uc, UC_PPC_REG_FPR1, &bits);
     }
+    out->has_redirect = e.has_redirect;
+    out->redirect_pc = e.redirect_pc;
+    out->call_r3 = e.call_r3;
+    out->call_r4 = e.call_r4;
+    out->call_lr = e.call_lr;
     *ret = e.ret;
 }

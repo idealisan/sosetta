@@ -14,6 +14,7 @@
 static int trace_state = -1;
 static uint32_t trace_ring[TRACE_RING_SIZE];
 static unsigned trace_ring_pos;
+static unsigned trace_prints;
 
 static int trace_enabled(void)
 {
@@ -23,8 +24,31 @@ static int trace_enabled(void)
     return trace_state;
 }
 
-static void trace_block(uint32_t pc)
+static void trace_block(uc_engine *uc, uint32_t pc)
 {
+    unsigned i;
+
+    if (pc >= 0x8fe00000u && pc < 0x90000000u && trace_prints < TRACE_MAX_PRINTS) {
+        uint8_t code[16];
+        fprintf(stderr,
+                "[sosetta] enter dyld stub region at 0x%08x, code:",
+                pc);
+        if (uc_mem_read(uc, pc, code, sizeof(code)) == 0) {
+            unsigned w;
+            for (w = 0; w < 16; w += 4) {
+                fprintf(stderr, " %02x%02x%02x%02x",
+                        code[w], code[w + 1], code[w + 2], code[w + 3]);
+            }
+        }
+        fprintf(stderr, ", recent blocks:");
+        i = trace_ring_pos;
+        do {
+            i = (i == 0) ? TRACE_RING_SIZE - 1 : i - 1;
+            fprintf(stderr, " 0x%08x", trace_ring[i]);
+        } while (i != trace_ring_pos);
+        fprintf(stderr, "\n");
+        trace_prints++;
+    }
     trace_ring[trace_ring_pos] = pc;
     trace_ring_pos = (trace_ring_pos + 1u) % TRACE_RING_SIZE;
 }
@@ -49,15 +73,29 @@ void sosetta_guest_dump_trace(void)
 static void block_cb(uc_engine *uc, uint64_t address, uint32_t size,
                      void *user_data)
 {
-    (void)uc;
     (void)size;
     (void)user_data;
-    trace_block((uint32_t)address);
+    trace_block(uc, (uint32_t)address);
 }
 
 static uint32_t watch_addr;
 static uint32_t watch_end;
 static int watch_ready = -1;
+
+static bool write_prot_cb(uc_engine *uc, uc_mem_type type, uint64_t addr,
+                          int size, int64_t value, void *user_data)
+{
+    uint32_t pc = 0;
+
+    (void)type;
+    (void)user_data;
+    uc_reg_read(uc, UC_PPC_REG_PC, &pc);
+    fprintf(stderr,
+            "[sosetta] write-prot: addr=0x%08llx size=%d value=0x%08llx from pc=0x%08x\n",
+            (unsigned long long)addr, size, (unsigned long long)(uint64_t)value,
+            pc);
+    return false;
+}
 
 static void watch_cb(uc_engine *uc, uc_mem_type type, uint64_t addr, int size,
                      int64_t value, void *user_data)
@@ -140,11 +178,24 @@ static bool fetch_unmapped_cb(uc_engine *uc, uc_mem_type type,
             a[i] = 0;
         }
     }
-    sosetta_hle_call(g, g->sys, (pc - HLE_TRAP_BASE) / 4u, a, &ret);
-    sosetta_guest_set_gpr(g, 3, ret);
-    g->sys->resume_pc = lr;
-    g->sys->trap_pending = 1;
-    uc_emu_stop(uc);
+    {
+        hle_env_public ep;
+        sosetta_hle_call(g, g->sys, pc, (pc - HLE_TRAP_BASE) / 4u, a, &ret,
+                         &ep);
+        if (ep.has_redirect) {
+            uint32_t r3v = ep.call_r3;
+            uint32_t r4v = ep.call_r4;
+            sosetta_guest_set_gpr(g, 3, r3v);
+            sosetta_guest_set_gpr(g, 4, r4v);
+            uc_reg_write(uc, UC_PPC_REG_LR, &ep.call_lr);
+            g->sys->resume_pc = ep.redirect_pc;
+        } else {
+            sosetta_guest_set_gpr(g, 3, ret);
+            g->sys->resume_pc = lr;
+        }
+        g->sys->trap_pending = 1;
+        uc_emu_stop(uc);
+    }
     return true;
 }
 
@@ -308,6 +359,13 @@ int sosetta_guest_install_syscall(sosetta_guest *g, sosetta_syscall_ctx *ctx)
                       fetch_unmapped_cb, g, 1, 0);
     if (err != UC_ERR_OK) {
         return -1;
+    }
+    if (trace_enabled()) {
+        uc_hook wp;
+        if (uc_hook_add(g->uc, &wp, UC_HOOK_MEM_WRITE_PROT, write_prot_cb, g,
+                        1, 0) == UC_ERR_OK) {
+            fprintf(stderr, "[sosetta] write-prot tracing on\n");
+        }
     }
     if (trace_enabled()) {
         err = uc_hook_add(g->uc, &g->block_hook, UC_HOOK_BLOCK, block_cb, g, 1, 0);

@@ -181,6 +181,9 @@ int sosetta_runtime_load(sosetta_runtime *rt)
         sosetta_seg *s = &im->segs[i];
         uint32_t prot = s->initprot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXEC);
 
+        if (strcmp(s->segname, "__PAGEZERO") == 0) {
+            continue;
+        }
         if (prot == 0) {
             prot = VM_PROT_READ;
         }
@@ -204,15 +207,21 @@ int sosetta_runtime_load(sosetta_runtime *rt)
     }
 
     {
-        uint32_t stub[2];
+        uint8_t stub[8];
         uint32_t a;
-        stub[0] = 0x38600000u;
-        stub[1] = 0x4e800020u;
+        put_be32(stub, 0x38600000u);
+        put_be32(stub + 4, 0x4e800020u);
         if (sosetta_guest_map(rt->guest, DYLD_STUB_BASE, DYLD_STUB_SIZE,
                               VM_PROT_READ | VM_PROT_EXEC) == 0) {
             for (a = 0; a < DYLD_STUB_SIZE; a += sizeof(stub)) {
                 sosetta_guest_write(rt->guest, DYLD_STUB_BASE + a, stub,
                                     sizeof(stub));
+            }
+        }
+        if (sosetta_guest_map(rt->guest, 0, RUNTIME_PAGE_SIZE,
+                              VM_PROT_READ | VM_PROT_EXEC) == 0) {
+            for (a = 0; a < RUNTIME_PAGE_SIZE; a += sizeof(stub)) {
+                sosetta_guest_write(rt->guest, a, stub, sizeof(stub));
             }
         }
     }
@@ -389,10 +398,29 @@ int sosetta_runtime_run(sosetta_runtime *rt)
     }
 
     rt->guest->run_timeout_us = RUN_TIMEOUT_US;
+    rt->guest->run_until = 1u;
     for (;;) {
+        uint32_t cur_pc = 0;
+        sosetta_guest_get_pc(rt->guest, &cur_pc);
+        if (cur_pc == 0) {
+            uint32_t lr = 0;
+            uc_reg_read(rt->guest->uc, UC_PPC_REG_LR, &lr);
+            sosetta_guest_set_gpr(rt->guest, 3, 0);
+            if (lr == 0) {
+                fprintf(stderr, "[sosetta] null call with null lr\n");
+                return -1;
+            }
+            if (sosetta_guest_set_pc(rt->guest, lr) != 0) {
+                return -1;
+            }
+            continue;
+        }
         int uerr = sosetta_guest_run(rt->guest);
         if (rt->sys.trap_pending) {
             rt->sys.trap_pending = 0;
+            if (rt->sys.should_stop) {
+                break;
+            }
             if (sosetta_guest_set_pc(rt->guest, rt->sys.resume_pc) != 0) {
                 return -1;
             }
@@ -400,8 +428,7 @@ int sosetta_runtime_run(sosetta_runtime *rt)
         }
         if (uerr != 0) {
             uint32_t pc = 0;
-            (void)sosetta_guest_get_pc(rt->guest, &pc);
-            fprintf(stderr, "[sosetta] guest stopped: %s (pc=0x%08x)\n",
+            (void)sosetta_guest_get_pc(rt->guest, &pc);            fprintf(stderr, "[sosetta] guest stopped: %s (pc=0x%08x)\n",
                     uc_strerror((uc_err)uerr), pc);
             {
                 unsigned ri;
@@ -426,6 +453,15 @@ int sosetta_runtime_run(sosetta_runtime *rt)
             }
             sosetta_guest_dump_trace();
             return -1;
+        }
+        if (rt_trace()) {
+            uint32_t pc = 0;
+            uint32_t lr = 0;
+            sosetta_guest_get_pc(rt->guest, &pc);
+            uc_reg_read(rt->guest->uc, UC_PPC_REG_LR, &lr);
+            fprintf(stderr,
+                    "[sosetta] clean stop without should_stop (pc=0x%08x lr=0x%08x)\n",
+                    pc, lr);
         }
         break;
     }

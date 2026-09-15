@@ -2,6 +2,7 @@
 
 #include "sosetta/syscall.h"
 #include "sosetta/cpu.h"
+#include "sosetta/hle.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -273,7 +274,7 @@ void sosetta_bsd_syscall(sosetta_guest *g, sosetta_syscall_ctx *ctx, uint32_t nr
             *ret = (uint32_t)fail_linux(ENOMEM);
             return;
         }
-        fd = read((int)(int32_t)a[0], buf, n);
+        fd = read(sosetta_hle_host_fd((int)(int32_t)a[0]), buf, n);
         if (fd >= 0) {
             if (sosetta_guest_write(g, a[1], buf, (size_t)fd) != 0) {
                 *ret = (uint32_t)fail_linux(EFAULT);
@@ -307,7 +308,7 @@ void sosetta_bsd_syscall(sosetta_guest *g, sosetta_syscall_ctx *ctx, uint32_t nr
             return;
         }
         while (total < (ssize_t)n) {
-            r = write((int)(int32_t)a[0], buf + total, n - (size_t)total);
+            r = write(sosetta_hle_host_fd((int)(int32_t)a[0]), buf + total, n - (size_t)total);
             if (r < 0) {
                 if (errno == EINTR) {
                     continue;
