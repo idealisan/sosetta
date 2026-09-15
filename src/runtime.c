@@ -211,10 +211,17 @@ int sosetta_runtime_load(sosetta_runtime *rt)
     {
         uint8_t stub[8];
         uint32_t a;
+        int mapped = 0;
         put_be32(stub, 0x38600000u);
         put_be32(stub + 4, 0x4e800020u);
         if (sosetta_guest_map(rt->guest, DYLD_STUB_BASE, DYLD_STUB_SIZE,
                               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXEC) == 0) {
+            mapped = 1;
+        } else if (sosetta_guest_map(rt->guest, DYLD_STUB_BASE, DYLD_STUB_SIZE,
+                                     VM_PROT_READ | VM_PROT_EXEC) == 0) {
+            mapped = 1;
+        }
+        if (mapped) {
             for (a = 0; a < DYLD_STUB_SIZE; a += sizeof(stub)) {
                 sosetta_guest_write(rt->guest, DYLD_STUB_BASE + a, stub,
                                     sizeof(stub));

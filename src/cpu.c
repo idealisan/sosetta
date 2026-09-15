@@ -41,7 +41,6 @@ static bool write_prot_cb(uc_engine *uc, uc_mem_type type, uint64_t addr,
     uint32_t pc = 0;
     char sym[128];
 
-    (void)type;
     (void)user_data;
     uc_reg_read(uc, UC_PPC_REG_PC, &pc);
     sosetta_debug_sym(pc, sym, sizeof(sym));
@@ -49,6 +48,14 @@ static bool write_prot_cb(uc_engine *uc, uc_mem_type type, uint64_t addr,
             "[sosetta] mem-prot: addr=0x%08llx size=%d value=0x%08llx from pc=0x%08x (%s)\n",
             (unsigned long long)addr, size, (unsigned long long)(uint64_t)value,
             pc, sym);
+    if ((type == UC_MEM_WRITE_PROT || type == UC_MEM_WRITE_UNMAPPED) &&
+        addr >= 0x8fe00000u && addr < 0x90000000u) {
+        uint32_t page = (uint32_t)addr & ~0xFFFu;
+        if (uc_mem_protect(uc, page, 0x1000u,
+                           UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC) == UC_ERR_OK) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -131,24 +138,14 @@ static bool fetch_unmapped_cb(uc_engine *uc, uc_mem_type type,
         uc_reg_read(uc, UC_PPC_REG_LR, &lr);
         sosetta_guest_get_gpr(g, 3, &key);
         sosetta_guest_get_gpr(g, 4, &sz);
-        if (key == 1) {
+        if (key == 1 && sz <= 0x4000000u) {
             blk = sosetta_hle_alloc_zeroed(g, sz);
-            if (blk == 0) {
-                blk = 0x8fe01000u;
+            if (trace_enabled()) {
+                fprintf(stderr, "[sosetta] keymgr alloc sz=%u blk=0x%08x\n", sz, blk);
             }
             sosetta_guest_set_gpr(g, 3, blk);
-        } else if (sz == 0) {
-            uint32_t obj = 0;
-            sosetta_guest_get_gpr(g, 3, &obj);
-            sosetta_guest_set_gpr(g, 30, obj);
         } else {
-            blk = sosetta_hle_alloc_zeroed(g, sz);
-            if (blk == 0) {
-                blk = 0x8fe01000u;
-            }
-            sosetta_guest_set_gpr(g, 2, blk);
-            sosetta_guest_set_gpr(g, 3, blk);
-            sosetta_guest_set_gpr(g, 30, blk);
+            sosetta_guest_set_gpr(g, 3, 0);
         }
         g->sys->resume_pc = lr;
         g->sys->trap_pending = 1;

@@ -187,147 +187,38 @@ static void heap_init(sosetta_guest *g)
     heap_free_head = HEAP_BASE;
 }
 
+static uint32_t heap_bump;
+
 static uint32_t halloc(sosetta_guest *g, uint32_t n)
 {
     uint32_t need = ((n + 15u) & ~15u) + 8u;
-    uint32_t prev = 0;
-    uint32_t cur;
-    uint8_t hdr[8];
+    uint32_t blk;
 
-    if (need < 8u || need > HEAP_SIZE) {
+    if (n == 0 || need < 8u || heap_bump + need > HEAP_BASE + HEAP_SIZE) {
         if (trace_enabled()) {
-            fprintf(stderr, "[sosetta] halloc REJECT n=%u need=%u\n", n, need);
+            fprintf(stderr, "[sosetta] halloc FAIL n=%u\n", n);
         }
         return 0;
     }
-    if (heap_free_head == 0) {
-        heap_init(g);
+    if (heap_bump < HEAP_BASE + 8u) {
+        heap_bump = HEAP_BASE + 8u;
     }
-    cur = heap_free_head;
-    while (cur != 0 && cur + 8u <= HEAP_BASE + HEAP_SIZE) {
-        uint32_t size;
-        uint32_t next;
-        if (g_read(g, cur, hdr, 8) != 0) {
-            return 0;
-        }
-        size = be32(hdr);
-        next = be32(hdr + 4);
-        if ((size & 1u) == 0 && size >= need) {
-            uint32_t rem = size - need;
-            if (rem >= 16u) {
-                put_be32(hdr, rem);
-                put_be32(hdr + 4, next);
-                g_write(g, cur + need, hdr, 8);
-                if (prev == 0) {
-                    heap_free_head = cur + need;
-                } else {
-                    uint8_t p[4];
-                    put_be32(p, cur + need);
-                    g_write(g, prev + 4, p, 4);
-                }
-            } else {
-                if (prev == 0) {
-                    heap_free_head = next;
-                } else {
-                    uint8_t p[4];
-                    put_be32(p, next);
-                    g_write(g, prev + 4, p, 4);
-                }
-                need = size;
-            }
-            put_be32(hdr, need | 1u);
-            g_write(g, cur, hdr, 4);
-            return cur + 8u;
-        }
-        prev = cur;
-        cur = next;
+    blk = heap_bump;
+    heap_bump += need;
+    {
+        uint8_t hdr[4];
+        put_be32(hdr, need | 1u);
+        g_write(g, blk, hdr, 4);
     }
-    if (trace_enabled()) {
-        fprintf(stderr, "[sosetta] halloc FAIL n=%u need=%u\n", n, need);
-    }
-    return 0;
+    return blk + 8u;
 }
 
 static void hfree(sosetta_guest *g, uint32_t p)
 {
-    uint8_t hdr[8];
-    uint8_t w4[4];
-    uint32_t h;
-    uint32_t size;
-    uint32_t prev;
-    uint32_t cur;
-    uint32_t next;
-
-    if (p == 0) {
-        return;
-    }
-    if (p < HEAP_BASE + 8u || p >= HEAP_BASE + HEAP_SIZE) {
-        if (trace_enabled()) {
-            fprintf(stderr, "[sosetta] hfree FOREIGN ptr=0x%08x\n", p);
-        }
-        return;
-    }
-    h = p - 8u;
-    if (g_read(g, h, hdr, 4) != 0) {
-        return;
-    }
-    size = be32(hdr) & ~1u;
-    prev = 0;
-    cur = heap_free_head;
-    while (cur != 0 && cur < h) {
-        uint32_t curn;
-        if (g_read(g, cur + 4, w4, 4) != 0) {
-            return;
-        }
-        curn = be32(w4);
-        prev = cur;
-        cur = curn;
-    }
-    if (g_read(g, cur, hdr, 8) == 0 && cur != 0) {
-        return;
-    }
-    next = (cur != 0) ? be32(hdr + 4) : 0;
-    if (cur != 0) {
-        uint8_t full[8];
-        if (g_read(g, cur, full, 8) != 0) {
-            return;
-        }
-        next = be32(full + 4);
-    }
-    put_be32(hdr, size);
-    put_be32(hdr + 4, cur);
-    g_write(g, h, hdr, 8);
-    if (prev == 0) {
-        heap_free_head = h;
-    } else {
-        uint8_t p4[4];
-        put_be32(p4, h);
-        g_write(g, prev + 4, p4, 4);
-    }
-    if (cur != 0 && h + size == cur) {
-        uint8_t c[8];
-        if (g_read(g, cur, c, 8) == 0) {
-            return;
-        }
-        size += be32(c);
-        put_be32(hdr, size);
-        put_be32(hdr + 4, be32(c + 4));
-        g_write(g, h, hdr, 8);
-    }
-    if (prev != 0) {
-        uint8_t p8[8];
-        uint32_t psize;
-        if (g_read(g, prev, p8, 8) != 0) {
-            return;
-        }
-        psize = be32(p8);
-        if (prev + psize == h) {
-            put_be32(p8, psize + size);
-            put_be32(p8 + 4, next);
-            g_write(g, prev, p8, 8);
-        }
-    }
+    (void)g;
+    (void)p;
 }
+
 
 #define FDMAP_SIZE 256
 #define FDMAP_BASE 64
@@ -385,7 +276,6 @@ static void hle_socket_init(void)
     }
     fdmap_next = FDMAP_BASE;
 }
-
 #define SF_SLOTS 20
 #define SF_STRIDE 152u
 
@@ -417,6 +307,97 @@ static int sf_take(void)
         }
     }
     return -1;
+}
+
+static int sf_read(FILE *hf, int fd, void *buf, size_t n, size_t *got)
+{
+    if (hf) {
+        *got = fread(buf, 1, n, hf);
+        return 0;
+    }
+    if (fd >= 0) {
+        ssize_t r = read(fd, buf, n);
+        *got = r > 0 ? (size_t)r : 0;
+        return r < 0 ? -1 : 0;
+    }
+    return -1;
+}
+
+static int sf_write(FILE *hf, int fd, const void *buf, size_t n, size_t *put)
+{
+    if (hf) {
+        *put = fwrite(buf, 1, n, hf);
+        return 0;
+    }
+    if (fd >= 0) {
+        ssize_t r = write(fd, buf, n);
+        *put = r > 0 ? (size_t)r : 0;
+        return r < 0 ? -1 : 0;
+    }
+    return -1;
+}
+
+static int sf_get_stream(hle_env *e, uint32_t gaddr, FILE **hf, int *fd,
+                         int **eof, int **err)
+{
+    int slot = sf_slot_of(gaddr);
+    if (slot < 0 || sf_kind[slot] == SF_KIND_FREE) {
+        hle_set_errno(e, 9);
+        return -1;
+    }
+    *hf = (sf_kind[slot] == SF_KIND_FILE) ? sf_host[slot] : NULL;
+    *fd = (sf_kind[slot] == SF_KIND_STD) ? sf_fd[slot] : -1;
+    *eof = &sf_eof[slot];
+    *err = &sf_err[slot];
+    return 0;
+}
+
+static char obuf[65536];
+static size_t olen;
+
+static void obuf_reset(void)
+{
+    olen = 0;
+}
+
+static void obuf_add(const char *s, size_t n)
+{
+    if (olen + n > sizeof(obuf)) {
+        n = sizeof(obuf) - olen;
+    }
+    memcpy(obuf + olen, s, n);
+    olen += n;
+}
+
+typedef struct fmt_target {
+    int kind;
+    sosetta_guest *g;
+    FILE *hf;
+    int fd;
+    uint32_t gbuf;
+    uint32_t gcap;
+} fmt_target;
+
+static void fmt_flush(fmt_target *t)
+{
+    size_t put = 0;
+    if (olen == 0) {
+        return;
+    }
+    if (t->kind == 1) {
+        sf_write(t->hf, t->fd, obuf, olen, &put);
+    } else if (t->kind == 2) {
+        uint32_t n = (uint32_t)olen;
+        if (n > t->gcap - 1u) {
+            n = t->gcap - 1u;
+        }
+        g_write(t->g, t->gbuf, obuf, n);
+        {
+            uint8_t z = 0;
+            g_write(t->g, t->gbuf + n, &z, 1);
+        }
+    }
+    olen = 0;
 }
 
 static void hle_socket(hle_env *e)
@@ -775,97 +756,6 @@ static void hle_fcntl_real(hle_env *e)
         return;
     }
     e->ret = (uint32_t)fcntl(host_fd, (int)e->a[1]);
-}
-
-static int sf_read(FILE *hf, int fd, void *buf, size_t n, size_t *got)
-{
-    if (hf) {
-        *got = fread(buf, 1, n, hf);
-        return 0;
-    }
-    if (fd >= 0) {
-        ssize_t r = read(fd, buf, n);
-        *got = r > 0 ? (size_t)r : 0;
-        return r < 0 ? -1 : 0;
-    }
-    return -1;
-}
-
-static int sf_write(FILE *hf, int fd, const void *buf, size_t n, size_t *put)
-{
-    if (hf) {
-        *put = fwrite(buf, 1, n, hf);
-        return 0;
-    }
-    if (fd >= 0) {
-        ssize_t r = write(fd, buf, n);
-        *put = r > 0 ? (size_t)r : 0;
-        return r < 0 ? -1 : 0;
-    }
-    return -1;
-}
-
-static int sf_get_stream(hle_env *e, uint32_t gaddr, FILE **hf, int *fd,
-                         int **eof, int **err)
-{
-    int slot = sf_slot_of(gaddr);
-    if (slot < 0 || sf_kind[slot] == SF_KIND_FREE) {
-        hle_set_errno(e, 9);
-        return -1;
-    }
-    *hf = (sf_kind[slot] == SF_KIND_FILE) ? sf_host[slot] : NULL;
-    *fd = (sf_kind[slot] == SF_KIND_STD) ? sf_fd[slot] : -1;
-    *eof = &sf_eof[slot];
-    *err = &sf_err[slot];
-    return 0;
-}
-
-static char obuf[65536];
-static size_t olen;
-
-static void obuf_reset(void)
-{
-    olen = 0;
-}
-
-static void obuf_add(const char *s, size_t n)
-{
-    if (olen + n > sizeof(obuf)) {
-        n = sizeof(obuf) - olen;
-    }
-    memcpy(obuf + olen, s, n);
-    olen += n;
-}
-
-typedef struct fmt_target {
-    int kind;
-    sosetta_guest *g;
-    FILE *hf;
-    int fd;
-    uint32_t gbuf;
-    uint32_t gcap;
-} fmt_target;
-
-static void fmt_flush(fmt_target *t)
-{
-    size_t put = 0;
-    if (olen == 0) {
-        return;
-    }
-    if (t->kind == 1) {
-        sf_write(t->hf, t->fd, obuf, olen, &put);
-    } else if (t->kind == 2) {
-        uint32_t n = (uint32_t)olen;
-        if (n > t->gcap - 1u) {
-            n = t->gcap - 1u;
-        }
-        g_write(t->g, t->gbuf, obuf, n);
-        {
-            uint8_t z = 0;
-            g_write(t->g, t->gbuf + n, &z, 1);
-        }
-    }
-    olen = 0;
 }
 
 static void vfmt(hle_env *e, fmt_target *t, uint32_t fmt_addr, unsigned vi)
@@ -2820,44 +2710,6 @@ static const struct hle_entry hle_table[] = {
     { "_mlock", hle_mlock },
     { "_fsetxattr", hle_fsetxattr },
     { "_socket", hle_socket },
-    { "_bind", hle_enosys },
-    { "_listen", hle_enosys },
-    { "_accept", hle_enosys },
-    { "_connect", hle_connect },
-    { "_shutdown", hle_enosys },
-    { "_setsockopt", hle_enosys },
-    { "_getsockopt", hle_getsockopt },
-    { "_getsockname", hle_enosys },
-    { "_getpeername", hle_enosys },
-    { "_send", hle_send },
-    { "_sendto", hle_enosys },
-    { "_recv", hle_recv },
-    { "_recvfrom", hle_enosys },
-    { "_sendmsg", hle_enosys },
-    { "_recvmsg", hle_enosys },
-    { "_socketpair", hle_enosys },
-    { "_pipe", hle_enosys },
-    { "_poll", hle_enosys },
-    { "_select", hle_select },
-    { "_ioctl", hle_enosys },
-    { "_fcntl", hle_fcntl_real },
-    { "_getaddrinfo", hle_getaddrinfo },
-    { "_freeaddrinfo", hle_freeaddrinfo },
-    { "_getnameinfo", hle_enosys },
-    { "_freeifaddrs", hle_enosys },
-    { "_getifaddrs", hle_enosys },
-    { "_if_nametoindex", hle_enosys },
-    { "_dladdr", hle_enosys },
-    { "_dlclose", hle_enosys },
-    { "_dlerror", hle_enosys },
-    { "_dlopen", hle_enosys },
-    { "_dlsym", hle_enosys },
-    { "_getpwuid", hle_getpwuid },
-    { "_getpwuid_r", hle_getpwuid_r },
-    { "_gethostbyname", hle_gethostbyname },
-    { "_sysctlbyname", hle_sysctlbyname },
-    { "_setlocale", hle_setlocale },
-    { "_socket", hle_socket },
     { "_connect", hle_connect },
     { "_send", hle_send },
     { "_recv", hle_recv },
@@ -2874,6 +2726,35 @@ static const struct hle_entry hle_table[] = {
     { "__dyld_get_image_header", hle_dyld_get_image_header },
     { "__dyld_get_image_name", hle_dyld_get_image_name },
     { "_bsearch", hle_bsearch },
+    { "_setlocale", hle_setlocale },
+    { "_sysctlbyname", hle_sysctlbyname },
+    { "_gethostbyname", hle_gethostbyname },
+    { "_getpwuid", hle_getpwuid },
+    { "_getpwuid_r", hle_getpwuid_r },
+    { "_bind", hle_enosys },
+    { "_listen", hle_enosys },
+    { "_accept", hle_enosys },
+    { "_shutdown", hle_enosys },
+    { "_setsockopt", hle_enosys },
+    { "_getsockname", hle_enosys },
+    { "_getpeername", hle_enosys },
+    { "_sendto", hle_enosys },
+    { "_recvfrom", hle_enosys },
+    { "_sendmsg", hle_enosys },
+    { "_recvmsg", hle_enosys },
+    { "_socketpair", hle_enosys },
+    { "_pipe", hle_enosys },
+    { "_poll", hle_enosys },
+    { "_ioctl", hle_enosys },
+    { "_getnameinfo", hle_enosys },
+    { "_freeifaddrs", hle_enosys },
+    { "_getifaddrs", hle_enosys },
+    { "_if_nametoindex", hle_enosys },
+    { "_dladdr", hle_enosys },
+    { "_dlclose", hle_enosys },
+    { "_dlerror", hle_enosys },
+    { "_dlopen", hle_enosys },
+    { "_dlsym", hle_enosys },
 };
 
 #define HLE_TABLE_N (sizeof(hle_table) / sizeof(hle_table[0]))
