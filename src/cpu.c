@@ -144,6 +144,13 @@ static bool fetch_unmapped_cb(uc_engine *uc, uc_mem_type type,
                 fprintf(stderr, "[sosetta] keymgr alloc sz=%u blk=0x%08x\n", sz, blk);
             }
             sosetta_guest_set_gpr(g, 3, blk);
+        } else if (sz <= 0x4000000u) {
+            blk = sosetta_hle_alloc_zeroed(g, sz);
+            if (trace_enabled()) {
+                fprintf(stderr, "[sosetta] keymgr generic sz=%u blk=0x%08x\n", sz, blk);
+            }
+            sosetta_guest_set_gpr(g, 2, blk);
+            sosetta_guest_set_gpr(g, 3, blk);
         } else {
             sosetta_guest_set_gpr(g, 3, 0);
         }

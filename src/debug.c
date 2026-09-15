@@ -444,5 +444,22 @@ void sosetta_debug_report(sosetta_guest *g, const char *reason, uint32_t pc)
             sosetta_debug_sym(a, sym, sizeof(sym));
             fprintf(stderr, "[sosetta]   -%02zu 0x%08x (%s)\n", k, a, sym);
         }
+        {
+            const char *rf = getenv("SOSETTA_RING_FILE");
+            if (rf) {
+                FILE *f = fopen(rf, "w");
+                if (f) {
+                    size_t total = d_ring_pos < d_ring_cap ? d_ring_pos : d_ring_cap;
+                    for (k = 0; k < total; k++) {
+                        size_t idx = (d_ring_pos - 1u - k) % d_ring_cap;
+                        char sym[128];
+                        sosetta_debug_sym(d_ring[idx], sym, sizeof(sym));
+                        fprintf(f, "-%zu 0x%08x %s\n", k, d_ring[idx], sym);
+                    }
+                    fclose(f);
+                    fprintf(stderr, "[sosetta] ring written to %s\n", rf);
+                }
+            }
+        }
     }
 }

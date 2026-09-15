@@ -463,7 +463,15 @@ int sosetta_runtime_run(sosetta_runtime *rt)
 
     rt->exit_code = rt->sys.exit_code;
     if (!rt->sys.should_stop) {
+        uint32_t pc = 0;
+        sosetta_guest_get_pc(rt->guest, &pc);
+        sosetta_debug_report(rt->guest, "exit without should_stop", pc);
         return -1;
+    }
+    if (rt_trace()) {
+        uint32_t pc = 0;
+        sosetta_guest_get_pc(rt->guest, &pc);
+        sosetta_debug_report(rt->guest, "clean exit", pc);
     }
     return rt->exit_code;
 }
