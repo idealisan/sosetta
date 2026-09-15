@@ -258,7 +258,13 @@ static void hfree(sosetta_guest *g, uint32_t p)
     uint32_t cur;
     uint32_t next;
 
-    if (p == 0 || p < HEAP_BASE + 8u || p >= HEAP_BASE + HEAP_SIZE) {
+    if (p == 0) {
+        return;
+    }
+    if (p < HEAP_BASE + 8u || p >= HEAP_BASE + HEAP_SIZE) {
+        if (trace_enabled()) {
+            fprintf(stderr, "[sosetta] hfree FOREIGN ptr=0x%08x\n", p);
+        }
         return;
     }
     h = p - 8u;
