@@ -404,8 +404,19 @@ int sosetta_runtime_run(sosetta_runtime *rt)
         sosetta_guest_get_pc(rt->guest, &cur_pc);
         if (cur_pc == 0) {
             uint32_t lr = 0;
+            uint32_t key = 0;
             uc_reg_read(rt->guest->uc, UC_PPC_REG_LR, &lr);
-            sosetta_guest_set_gpr(rt->guest, 3, 0);
+            sosetta_guest_get_gpr(rt->guest, 3, &key);
+            if (key == 1) {
+                uint32_t sz = 0;
+                uint32_t blk;
+                sosetta_guest_get_gpr(rt->guest, 4, &sz);
+                blk = sosetta_hle_alloc_zeroed(rt->guest, sz);
+                sosetta_guest_set_gpr(rt->guest, 2, blk);
+                sosetta_guest_set_gpr(rt->guest, 3, 0);
+            } else {
+                sosetta_guest_set_gpr(rt->guest, 3, 0);
+            }
             if (lr == 0) {
                 fprintf(stderr, "[sosetta] null call with null lr\n");
                 return -1;

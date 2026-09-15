@@ -15,6 +15,7 @@ int sosetta_hle_bind(sosetta_guest *g, sosetta_syscall_ctx *ctx,
 void sosetta_hle_set_errno(sosetta_guest *g, sosetta_syscall_ctx *ctx,
                            uint32_t darwin_errno);
 int sosetta_hle_host_fd(int guest_fd);
+uint32_t sosetta_hle_alloc_zeroed(sosetta_guest *g, uint32_t size);
 
 typedef struct hle_env_public {
     int has_redirect;

@@ -340,6 +340,11 @@ static int hle_host_fd(int gfd)
     return -1;
 }
 
+uint32_t sosetta_hle_alloc_zeroed(sosetta_guest *g, uint32_t size)
+{
+    return halloc(g, size);
+}
+
 int sosetta_hle_host_fd(int guest_fd)
 {
     return hle_host_fd(guest_fd);
