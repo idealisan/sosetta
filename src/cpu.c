@@ -82,6 +82,60 @@ static uint32_t watch_addr;
 static uint32_t watch_end;
 static int watch_ready = -1;
 
+static uint32_t codetrace_begin;
+static uint32_t codetrace_end;
+static int codetrace_ready = -1;
+static uc_hook codetrace_hook;
+
+static void codetrace_cb(uc_engine *uc, uint64_t address, uint32_t size,
+                         void *user_data)
+{
+    uint32_t r2 = 0;
+    uint32_t r3 = 0;
+    uint32_t r4 = 0;
+
+    (void)uc;
+    (void)size;
+    sosetta_guest_get_gpr(user_data, 2, &r2);
+    sosetta_guest_get_gpr(user_data, 3, &r3);
+    sosetta_guest_get_gpr(user_data, 4, &r4);
+    fprintf(stderr,
+            "[sosetta] step 0x%08x r2=0x%08x r3=0x%08x r4=0x%08x\n",
+            (uint32_t)address, r2, r3, r4);
+}
+
+static void codetrace_install(sosetta_guest *g)
+{
+    const char *spec;
+    char *end = NULL;
+    unsigned long long a;
+    unsigned long long b;
+
+    if (codetrace_ready >= 0) {
+        return;
+    }
+    codetrace_ready = 1;
+    spec = getenv("SOSETTA_CODETRACE");
+    if (!spec) {
+        return;
+    }
+    a = strtoull(spec, &end, 0);
+    if (!end || *end != ':') {
+        return;
+    }
+    b = strtoull(end + 1, NULL, 0);
+    if (b <= a) {
+        return;
+    }
+    codetrace_begin = (uint32_t)a;
+    codetrace_end = (uint32_t)b;
+    if (uc_hook_add(g->uc, &codetrace_hook, UC_HOOK_CODE, codetrace_cb, g,
+                    codetrace_begin, codetrace_end) == UC_ERR_OK) {
+        fprintf(stderr, "[sosetta] codetrace 0x%08x..0x%08x\n",
+                codetrace_begin, codetrace_end);
+    }
+}
+
 static bool write_prot_cb(uc_engine *uc, uc_mem_type type, uint64_t addr,
                           int size, int64_t value, void *user_data)
 {
@@ -169,6 +223,37 @@ static bool fetch_unmapped_cb(uc_engine *uc, uc_mem_type type,
     (void)type;
     (void)size;
     (void)value;
+    if (pc == 0 && g->sys) {
+        uint32_t key = 0;
+        uint32_t sz = 0;
+        uint32_t blk;
+        uc_reg_read(uc, UC_PPC_REG_LR, &lr);
+        sosetta_guest_get_gpr(g, 3, &key);
+        sosetta_guest_get_gpr(g, 4, &sz);
+        if (key == 1) {
+            blk = sosetta_hle_alloc_zeroed(g, sz);
+            if (blk == 0) {
+                blk = 0x8fe01000u;
+            }
+            sosetta_guest_set_gpr(g, 3, blk);
+        } else if (sz == 0) {
+            uint32_t obj = 0;
+            sosetta_guest_get_gpr(g, 3, &obj);
+            sosetta_guest_set_gpr(g, 30, obj);
+        } else {
+            blk = sosetta_hle_alloc_zeroed(g, sz);
+            if (blk == 0) {
+                blk = 0x8fe01000u;
+            }
+            sosetta_guest_set_gpr(g, 2, blk);
+            sosetta_guest_set_gpr(g, 3, blk);
+            sosetta_guest_set_gpr(g, 30, blk);
+        }
+        g->sys->resume_pc = lr;
+        g->sys->trap_pending = 1;
+        uc_emu_stop(uc);
+        return true;
+    }
     if (pc < HLE_TRAP_BASE || pc >= HLE_TRAP_BASE + HLE_TRAP_SIZE || !g->sys) {
         return false;
     }
@@ -366,6 +451,14 @@ int sosetta_guest_install_syscall(sosetta_guest *g, sosetta_syscall_ctx *ctx)
                         1, 0) == UC_ERR_OK) {
             fprintf(stderr, "[sosetta] write-prot tracing on\n");
         }
+        if (uc_hook_add(g->uc, &wp, UC_HOOK_MEM_WRITE_UNMAPPED, write_prot_cb,
+                        g, 1, 0) == UC_ERR_OK) {
+            fprintf(stderr, "[sosetta] write-unmapped tracing on\n");
+        }
+        if (uc_hook_add(g->uc, &wp, UC_HOOK_MEM_READ_UNMAPPED, write_prot_cb,
+                        g, 1, 0) == UC_ERR_OK) {
+            fprintf(stderr, "[sosetta] read-unmapped tracing on\n");
+        }
     }
     if (trace_enabled()) {
         err = uc_hook_add(g->uc, &g->block_hook, UC_HOOK_BLOCK, block_cb, g, 1, 0);
@@ -373,6 +466,7 @@ int sosetta_guest_install_syscall(sosetta_guest *g, sosetta_syscall_ctx *ctx)
             return -1;
         }
         watch_install(g);
+        codetrace_install(g);
     }
     return 0;
 }

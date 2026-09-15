@@ -212,16 +212,10 @@ int sosetta_runtime_load(sosetta_runtime *rt)
         put_be32(stub, 0x38600000u);
         put_be32(stub + 4, 0x4e800020u);
         if (sosetta_guest_map(rt->guest, DYLD_STUB_BASE, DYLD_STUB_SIZE,
-                              VM_PROT_READ | VM_PROT_EXEC) == 0) {
+                              VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXEC) == 0) {
             for (a = 0; a < DYLD_STUB_SIZE; a += sizeof(stub)) {
                 sosetta_guest_write(rt->guest, DYLD_STUB_BASE + a, stub,
                                     sizeof(stub));
-            }
-        }
-        if (sosetta_guest_map(rt->guest, 0, RUNTIME_PAGE_SIZE,
-                              VM_PROT_READ | VM_PROT_EXEC) == 0) {
-            for (a = 0; a < RUNTIME_PAGE_SIZE; a += sizeof(stub)) {
-                sosetta_guest_write(rt->guest, a, stub, sizeof(stub));
             }
         }
     }
@@ -412,8 +406,10 @@ int sosetta_runtime_run(sosetta_runtime *rt)
                 uint32_t blk;
                 sosetta_guest_get_gpr(rt->guest, 4, &sz);
                 blk = sosetta_hle_alloc_zeroed(rt->guest, sz);
-                sosetta_guest_set_gpr(rt->guest, 2, blk);
-                sosetta_guest_set_gpr(rt->guest, 3, 0);
+                if (blk == 0) {
+                    blk = 0x8fe01000u;
+                }
+                sosetta_guest_set_gpr(rt->guest, 3, blk);
             } else {
                 sosetta_guest_set_gpr(rt->guest, 3, 0);
             }

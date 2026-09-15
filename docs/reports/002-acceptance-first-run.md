@@ -142,3 +142,35 @@ SOSETTA_TRACE=1 ../build/sosetta usr/local/bin/python3.13 -V
 2. 打通 resolver：验证同步 pthread 机制与 threaded resolver 的兼容性（`Curl_thread_create` → 同步执行 → done 标志）。
 3. HTTP GET 127.0.0.1 端到端（socket/connect/send/recv 已就绪）。
 4. qsort 的客户机回调实现（bsearch 同款机制复用）。
+
+---
+
+## 追加二（2026-09-14 第三轮：keymgr 攻关与单步调试设施）
+
+### 新增调试设施
+
+- `SOSETTA_CODETRACE=begin:end`：区间指令级跟踪（每条指令打印 PC/r2/r3/r4）
+- `SOSETTA_WATCH` 写监视点、写保护/写未映射/读未映射诊断钩子
+- pc==0 空调用拦截（keymgr 语义）
+
+### keymgr 问题破解过程
+
+用指令级跟踪发现 `curl_share_init`（0x748bc）内部的 `bctrl`（r3=1 key, r4=0x94 size）走的是**空页桩**（`li r3,0; blr` 在 emu 内执行把 r3 清零），拦截逻辑从未触发。修复链：
+
+1. `__PAGEZERO` 不再按文件映射（真实 dyld 留空，NULL 访问应产生可诊断故障）
+2. pc==0 进入 fetch-unmapped 钩子：按 keymgr 语义处理（key=1 → 分配 size 字节清零块入 r3；通用 → 分配块入 r2/r3/r30）
+3. dyld 桩区改 R|W|X（crt/libcurl 会写入 dyld 指针区做置零）
+4. vfprintf 实现（Darwin ppc32 va_list 解析）——curl 错误消息可见
+
+### 关键语义发现
+
+Darwin keymgr 约定（从 curl_share_init/curl_multi_init 反汇编确认）：
+- `keymgr(key, size)`：首次调用分配 size 字节清零块，返回块指针
+- `curl_share_init`：检查 r3（块指针，0=失败），r2=内部指针存 block[0]
+- `curl_multi_init`：`Curl_multi_handle` 内 keymgr(key=1, size=0x154=340) → 块即 multi 对象（magic 0xbab1e 写入 block[0]），随后 registrar 调用（r3=multi, r4=0）以 r30 传递
+- 通用 pc==0 语义：r4>0 → 分配块入 r2/r3/r30；r4==0 → r30=r3（注册对象）
+
+### 当前状态
+
+流程已深入 **OpenSSL 内部初始化**（RAND 种子复制循环 `Curl_ssl_scache`-区域读未映射，pc=0x83e70），即 `curl_global_init` → OpenSSL init 链。每修复一层暴露下一层——HLE 引导冰山。基础设施（陷阱/回调/分配/单步诊断）已完备，剩余为逐层满足 OpenSSL/libcurl 初始化依赖的迭代工作。
+- 回归：CTest 5/5 通过。
