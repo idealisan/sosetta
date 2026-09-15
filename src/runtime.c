@@ -1,6 +1,7 @@
 #include "sosetta/runtime.h"
 #include "sosetta/endian.h"
 #include "sosetta/hle.h"
+#include "sosetta/debug.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,6 +152,7 @@ void sosetta_runtime_close(sosetta_runtime *rt)
         sosetta_guest_close(rt->guest);
         rt->guest = NULL;
     }
+    sosetta_debug_shutdown();
     sosetta_macho_free(&rt->im);
     free(rt->filebuf);
     rt->filebuf = NULL;
@@ -242,6 +244,7 @@ int sosetta_runtime_load(sosetta_runtime *rt)
     if (rt->entry_pc == 0) {
         return -1;
     }
+    sosetta_debug_init(rt->guest, im);
     return 0;
 }
 
@@ -435,30 +438,8 @@ int sosetta_runtime_run(sosetta_runtime *rt)
         }
         if (uerr != 0) {
             uint32_t pc = 0;
-            (void)sosetta_guest_get_pc(rt->guest, &pc);            fprintf(stderr, "[sosetta] guest stopped: %s (pc=0x%08x)\n",
-                    uc_strerror((uc_err)uerr), pc);
-            {
-                unsigned ri;
-                uint32_t rv;
-                static const unsigned regs[6] = { 0, 1, 2, 3, 11, 12 };
-                for (ri = 0; ri < 6; ri++) {
-                    sosetta_guest_get_gpr(rt->guest, regs[ri], &rv);
-                    fprintf(stderr, "[sosetta]   r%u=0x%08x\n", regs[ri], rv);
-                }
-                {
-                    uint32_t sp = 0;
-                    uint8_t stk[32];
-                    unsigned w;
-                    sosetta_guest_get_gpr(rt->guest, 1, &sp);
-                    if (sosetta_guest_read(rt->guest, sp, stk, sizeof(stk)) == 0) {
-                        for (w = 0; w < 8; w++) {
-                            fprintf(stderr, "[sosetta]   sp+0x%02x = 0x%08x\n",
-                                    w * 4u, be32(stk + w * 4u));
-                        }
-                    }
-                }
-            }
-            sosetta_guest_dump_trace();
+            (void)sosetta_guest_get_pc(rt->guest, &pc);
+            sosetta_debug_report(rt->guest, uc_strerror((uc_err)uerr), pc);
             return -1;
         }
         if (rt_trace()) {

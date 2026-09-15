@@ -35,6 +35,5 @@ int sosetta_guest_get_cr(sosetta_guest *g, uint32_t *val);
 
 int sosetta_guest_install_syscall(sosetta_guest *g, sosetta_syscall_ctx *ctx);
 int sosetta_guest_run(sosetta_guest *g);
-void sosetta_guest_dump_trace(void);
 
 #endif

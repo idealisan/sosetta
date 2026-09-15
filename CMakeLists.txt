@@ -25,6 +25,7 @@ add_library(sosetta_core STATIC
     src/cpu.c
     src/syscall.c
     src/hle.c
+    src/debug.c
     src/runtime.c
 )
 target_include_directories(sosetta_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
